@@ -54,3 +54,4 @@ app.use((error: unknown, _request: express.Request, response: express.Response, 
 });
 
 export { app };
+export default app;
