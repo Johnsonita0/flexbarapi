@@ -15,6 +15,6 @@ Cloudflare R2 is configured through server-only environment variables. The R2 cl
 
 ## Vercel
 
-Create a Vercel project connected to the backend Git repository and set its Root Directory to `backend`. Configure `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `FRONTEND_ORIGINS`, and the R2 variables in Vercel project settings. Do not add secret values to `.env.example`.
+Create a Vercel project connected to the backend Git repository and set its Root Directory to `backend`. Configure `SUPABASE_URL`, either `SUPABASE_PUBLISHABLE_KEY` or `SUPABASE_ANON_KEY`, `FRONTEND_ORIGINS`, and the R2 variables in Vercel project settings. Do not add secret values to `.env.example`.
 
 Apply the single SQL setup file to the intended Supabase environment before enabling sign-in. Create/invite staff accounts through Supabase Auth; new profiles default to the least-privileged `staff` role and inactive access. Approve staff by activating their profile and assigning roles through a trusted administrative process, not client-side metadata. Disable public sign-ups in Supabase Auth settings.
