@@ -1,6 +1,8 @@
 import cors from "cors";
 import express from "express";
 import { requireUser } from "./auth/requireUser.js";
+import { attendanceRouter } from "./routes/attendance.js";
+import { adminRouter } from "./routes/admin.js";
 
 const app = express();
 const allowedOrigins = (process.env.FRONTEND_ORIGINS ?? "http://localhost:5173")
@@ -41,6 +43,9 @@ app.get("/api/v1/me", requireUser, (request, response) => {
     role: request.flexbarUser.role,
   });
 });
+
+app.use("/api/v1/admin", adminRouter);
+app.use("/api/v1/attendance", attendanceRouter);
 
 app.use((error: unknown, _request: express.Request, response: express.Response, _next: express.NextFunction) => {
   console.error("Unhandled API request error.", error);

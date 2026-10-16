@@ -22,6 +22,56 @@ create table if not exists public.profiles (
   updated_at timestamptz not null default now()
 );
 
+create table if not exists public.departments (
+  id uuid primary key default gen_random_uuid(),
+  name text not null,
+  created_at timestamptz not null default now()
+);
+
+create unique index if not exists departments_name_unique
+  on public.departments (lower(name));
+
+insert into public.departments (name)
+values
+  ('Management'),
+  ('Bar'),
+  ('Kitchen'),
+  ('Restaurant Floor'),
+  ('Cashier'),
+  ('Inventory & Store'),
+  ('Cleaning & Maintenance')
+on conflict do nothing;
+
+alter table public.profiles
+  add column if not exists department_id uuid references public.departments (id) on delete set null;
+
+create table if not exists public.business_settings (
+  id smallint primary key default 1 check (id = 1),
+  latitude double precision,
+  longitude double precision,
+  geofence_radius_m integer not null default 100 check (geofence_radius_m between 25 and 2000),
+  timezone text not null default 'Africa/Lagos',
+  updated_at timestamptz not null default now()
+);
+
+insert into public.business_settings (id)
+values (1)
+on conflict (id) do nothing;
+
+create table if not exists public.attendance_records (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references public.profiles (id) on delete cascade,
+  work_date date not null,
+  check_in_at timestamptz not null default now(),
+  check_out_at timestamptz,
+  check_in_latitude double precision not null,
+  check_in_longitude double precision not null,
+  check_out_latitude double precision,
+  check_out_longitude double precision,
+  created_at timestamptz not null default now(),
+  unique (user_id, work_date)
+);
+
 do $$
 begin
   if exists (
@@ -44,9 +94,22 @@ alter table public.profiles
   alter column is_active set default false;
 
 alter table public.profiles enable row level security;
+alter table public.departments enable row level security;
+alter table public.business_settings enable row level security;
+alter table public.attendance_records enable row level security;
 
 revoke all on public.profiles from anon, authenticated;
 grant select on public.profiles to authenticated;
+revoke all on public.departments from anon, authenticated;
+grant select on public.departments to authenticated;
+revoke all on public.business_settings, public.attendance_records from anon, authenticated;
+
+drop policy if exists "Authenticated users can read departments" on public.departments;
+create policy "Authenticated users can read departments"
+  on public.departments
+  for select
+  to authenticated
+  using (true);
 
 drop policy if exists "Users can read their own profile" on public.profiles;
 
