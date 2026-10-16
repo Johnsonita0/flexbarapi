@@ -4,7 +4,7 @@ Node.js, Express, and TypeScript API, designed for an independent Vercel deploym
 
 ## Local setup
 
-1. Copy `.env.example` to `.env` and fill in the Supabase anon/publishable key. The Flex Bar Supabase project URL is already set. Keep all real secrets out of Git.
+1. Copy `.env.example` to `.env` and configure `SUPABASE_PUBLISHABLE_KEY` or `SUPABASE_ANON_KEY`. The Flex Bar Supabase project URL is already set. Keep all real secrets out of Git.
 2. Apply the single SQL setup file `supabase/migrations/0001_profiles.sql` to the Supabase project. It promotes the supplied Supabase Auth UID to the active `super_admin` and disables workspace access for every other account until an administrator approves it.
 3. From this folder, run `npm install`, then `npm run dev`.
 4. Check `http://localhost:3000/api/v1/health`.

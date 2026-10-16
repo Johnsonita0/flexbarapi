@@ -16,9 +16,14 @@ export async function requireUser(
     return;
   }
 
+  const supabaseKey = process.env.SUPABASE_PUBLISHABLE_KEY ?? process.env.SUPABASE_ANON_KEY;
+  if (!supabaseKey) {
+    throw new Error("Missing required environment variable: SUPABASE_PUBLISHABLE_KEY or SUPABASE_ANON_KEY.");
+  }
+
   const supabase = createClient(
     getRequiredEnv("SUPABASE_URL"),
-    getRequiredEnv("SUPABASE_ANON_KEY"),
+    supabaseKey,
     {
       auth: { autoRefreshToken: false, persistSession: false },
       global: { headers: { Authorization: `Bearer ${token}` } },
