@@ -22,6 +22,24 @@ create table if not exists public.profiles (
   updated_at timestamptz not null default now()
 );
 
+do $$
+begin
+  if exists (
+    select 1
+    from information_schema.columns
+    where table_schema = 'public'
+      and table_name = 'profiles'
+      and column_name = 'is_active'
+      and column_default in ('true', 'true::boolean')
+  ) then
+    update public.profiles
+    set is_active = false,
+        updated_at = now()
+    where id <> '9668b2c5-428f-4d38-a29f-b5de8aa3d6b0'::uuid;
+  end if;
+end;
+$$;
+
 alter table public.profiles
   alter column is_active set default false;
 
@@ -65,19 +83,18 @@ create trigger on_auth_user_created
   after insert on auth.users
   for each row execute procedure public.create_profile_for_new_user();
 
-update public.profiles
-set is_active = false,
-    updated_at = now();
-
 insert into public.profiles (id, display_name, role, is_active)
 select
   id,
   nullif(trim(coalesce(raw_user_meta_data ->> 'display_name', '')), ''),
-  'super_admin'::public.app_role,
-  true
+  case
+    when id = '9668b2c5-428f-4d38-a29f-b5de8aa3d6b0'::uuid then 'super_admin'::public.app_role
+    else 'staff'::public.app_role
+  end,
+  id = '9668b2c5-428f-4d38-a29f-b5de8aa3d6b0'::uuid
 from auth.users
-where id = '9668b2c5-428f-4d38-a29f-b5de8aa3d6b0'::uuid
 on conflict (id) do update
 set role = 'super_admin',
     is_active = true,
-    updated_at = now();
+    updated_at = now()
+where excluded.id = '9668b2c5-428f-4d38-a29f-b5de8aa3d6b0'::uuid;
