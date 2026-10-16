@@ -7,6 +7,9 @@ declare global {
         id: string;
         email: string | null;
         displayName: string | null;
+        avatarPath: string | null;
+        hasLockPin: boolean;
+        isArchived: boolean;
         role: AppRole;
       };
     }

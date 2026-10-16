@@ -1,6 +1,7 @@
 import { Router } from "express";
 import type { Request, Response } from "express";
 import { requireUser } from "../auth/requireUser.js";
+import { AdminActivityWriteError, recordAdminActivity } from "../services/adminActivity.js";
 import { createSupabaseAdminClient } from "../services/supabaseAdmin.js";
 
 const router = Router();
@@ -12,6 +13,10 @@ interface Coordinates {
 
 function sendAttendanceError(response: Response, error: unknown, context: string) {
   console.error(context, error);
+  if (error instanceof AdminActivityWriteError) {
+    response.status(502).json({ error: "The location was saved, but its administrator activity entry could not be saved. Do not repeat the change; contact support." });
+    return;
+  }
   if (error instanceof Error && error.message.includes("Missing required environment variable: SUPABASE_SERVICE_ROLE_KEY")) {
     response.status(503).json({ error: "Attendance services are not configured yet. Please contact the system administrator." });
     return;
@@ -120,6 +125,25 @@ router.put("/config", async (request, response) => {
       sendAttendanceError(response, error, "Could not save attendance settings.");
       return;
     }
+    const actor = request.flexbarUser;
+    if (!actor) {
+      response.status(401).json({ error: "Please sign in to update the business location." });
+      return;
+    }
+    await recordAdminActivity(admin, {
+      actorId: actor.id,
+      actorName: actor.displayName ?? actor.email ?? "Super Admin",
+      actorEmail: actor.email,
+      action: "attendance.location.updated",
+      targetType: "business_settings",
+      targetLabel: "Attendance geofence",
+      details: {
+        latitude: coordinates.latitude,
+        longitude: coordinates.longitude,
+        radiusMeters,
+        timezone,
+      },
+    });
     response.status(200).json({ message: "Business attendance location saved." });
   } catch (error: unknown) {
     sendAttendanceError(response, error, "Could not initialize attendance settings.");
@@ -136,7 +160,7 @@ router.get("/records", async (request, response) => {
     const admin = createSupabaseAdminClient();
     let recordsQuery = admin
       .from("attendance_records")
-      .select("id, user_id, work_date, check_in_at, check_out_at")
+      .select("id, user_id, staff_name_snapshot, staff_email_snapshot, work_date, check_in_at, check_out_at")
       .order("work_date", { ascending: false })
       .order("check_in_at", { ascending: false })
       .limit(200);
@@ -156,11 +180,12 @@ router.get("/records", async (request, response) => {
     const departmentById = new Map((departments ?? []).map((department) => [department.id, department.name]));
     response.status(200).json({
       records: (records ?? []).map((record) => {
-        const profile = profileById.get(record.user_id);
+        const profile = record.user_id ? profileById.get(record.user_id) : undefined;
         return {
           id: record.id,
           userId: record.user_id,
-          name: profile?.display_name ?? "Flex Bar team member",
+          name: profile?.display_name ?? record.staff_name_snapshot ?? "Former staff member",
+          email: record.staff_email_snapshot,
           role: profile?.role ?? "staff",
           department: profile?.department_id ? departmentById.get(profile.department_id) ?? null : null,
           date: record.work_date,

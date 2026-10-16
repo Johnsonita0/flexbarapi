@@ -3,6 +3,7 @@ import express from "express";
 import { requireUser } from "./auth/requireUser.js";
 import { attendanceRouter } from "./routes/attendance.js";
 import { adminRouter } from "./routes/admin.js";
+import { profileRouter } from "./routes/profile.js";
 
 const app = express();
 const allowedOrigins = (process.env.FRONTEND_ORIGINS ?? "http://localhost:5173")
@@ -40,12 +41,15 @@ app.get("/api/v1/me", requireUser, (request, response) => {
     id: request.flexbarUser.id,
     email: request.flexbarUser.email,
     displayName: request.flexbarUser.displayName,
+    avatarPath: request.flexbarUser.avatarPath,
+    hasLockPin: request.flexbarUser.hasLockPin,
     role: request.flexbarUser.role,
   });
 });
 
 app.use("/api/v1/admin", adminRouter);
 app.use("/api/v1/attendance", attendanceRouter);
+app.use("/api/v1/profile", profileRouter);
 
 app.use((error: unknown, _request: express.Request, response: express.Response, _next: express.NextFunction) => {
   console.error("Unhandled API request error.", error);

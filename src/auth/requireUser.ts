@@ -42,7 +42,7 @@ export async function requireUser(
 
   const { data: profile, error: profileError } = await supabase
     .from("profiles")
-    .select("display_name, role, is_active")
+    .select("display_name, avatar_path, role, is_active, is_archived, lock_pin_hash")
     .eq("id", user.id)
     .single();
 
@@ -55,7 +55,7 @@ export async function requireUser(
     response.status(500).json({ error: "We couldn't load your account details. Please try again or contact your administrator." });
     return;
   }
-  if (!profile.is_active) {
+  if (!profile.is_active || profile.is_archived) {
     response.status(403).json({ error: "Your account is not approved to access this workspace. Please contact your administrator." });
     return;
   }
@@ -70,6 +70,10 @@ export async function requireUser(
     email: user.email ?? null,
     displayName:
       typeof profile.display_name === "string" ? profile.display_name : null,
+    avatarPath:
+      typeof profile.avatar_path === "string" ? profile.avatar_path : null,
+    hasLockPin: typeof profile.lock_pin_hash === "string",
+    isArchived: profile.is_archived,
     role: profile.role,
   };
   next();

@@ -10,7 +10,7 @@ export function requireSuperAdmin(
     return;
   }
   if (request.flexbarUser.role !== "super_admin") {
-    response.status(403).json({ error: "Only the Flex Bar super admin can manage users and departments." });
+    response.status(403).json({ error: "Only the Flex Bar system administrator can manage these settings." });
     return;
   }
   next();
