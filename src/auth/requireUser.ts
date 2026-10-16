@@ -42,16 +42,16 @@ export async function requireUser(
     .single();
 
   if (profileError?.code === "PGRST116") {
-    response.status(403).json({ error: "Your account does not have a Flex Bar profile." });
+    response.status(403).json({ error: "Your account is not ready to access the workspace. Please contact your administrator." });
     return;
   }
   if (profileError) {
     console.error("Could not load the authenticated user's profile.", profileError);
-    response.status(500).json({ error: "Could not load your account profile." });
+    response.status(500).json({ error: "We couldn't load your account details. Please try again or contact your administrator." });
     return;
   }
   if (!profile.is_active) {
-    response.status(403).json({ error: "This Flex Bar account is inactive." });
+    response.status(403).json({ error: "Your account is not approved to access this workspace. Please contact your administrator." });
     return;
   }
   if (!isAppRole(profile.role)) {
