@@ -140,38 +140,18 @@ $$;
 revoke all on function public.can_access_call_topic(text) from public, anon;
 grant execute on function public.can_access_call_topic(text) to authenticated;
 
-do $$
-begin
-  if not exists (
-    select 1 from pg_policies
-    where schemaname = 'realtime'
-      and tablename = 'messages'
-      and policyname = 'in_app_call_signaling_read'
-  ) then
-    execute $policy$
-      create policy in_app_call_signaling_read
-        on realtime.messages
-        for select
-        to authenticated
-        using (public.can_access_call_topic(realtime.topic()))
-    $policy$;
-  end if;
+drop policy if exists in_app_call_signaling_read on realtime.messages;
+create policy in_app_call_signaling_read
+  on realtime.messages
+  for select
+  to authenticated
+  using (public.can_access_call_topic(realtime.topic()));
 
-  if not exists (
-    select 1 from pg_policies
-    where schemaname = 'realtime'
-      and tablename = 'messages'
-      and policyname = 'in_app_call_signaling_write'
-  ) then
-    execute $policy$
-      create policy in_app_call_signaling_write
-        on realtime.messages
-        for insert
-        to authenticated
-        with check (public.can_access_call_topic(realtime.topic()))
-    $policy$;
-  end if;
-end
-$$;
+drop policy if exists in_app_call_signaling_write on realtime.messages;
+create policy in_app_call_signaling_write
+  on realtime.messages
+  for insert
+  to authenticated
+  with check (public.can_access_call_topic(realtime.topic()));
 
 commit;
