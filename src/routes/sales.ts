@@ -329,21 +329,33 @@ router.get("/report", async (request, response) => {
 });
 
 router.get("/notifications", async (request, response) => {
-  if (!canViewAdminSales(request, response)) return;
+  const user = request.flexbarUser;
+  if (!user) {
+    response.status(401).json({ error: "Please sign in to view your notifications." });
+    return;
+  }
   try {
     const admin = createSupabaseAdminClient();
-    const { data, error } = await admin
-      .from("notifications")
-      .select("id, type, title, detail, sale_id, created_at, read_at")
-      .eq("user_id", request.flexbarUser?.id ?? "")
-      .order("created_at", { ascending: false })
-      .limit(100);
-    if (error) {
-      handleError(response, error, "Could not load administrator notifications.");
+    const [notificationsResult, unreadResult] = await Promise.all([
+      admin
+        .from("notifications")
+        .select("id, type, title, detail, sale_id, created_at, read_at")
+        .eq("user_id", user.id)
+        .order("created_at", { ascending: false })
+        .limit(100),
+      admin
+        .from("notifications")
+        .select("id", { count: "exact", head: true })
+        .eq("user_id", user.id)
+        .is("read_at", null),
+    ]);
+    if (notificationsResult.error || unreadResult.error) {
+      handleError(response, notificationsResult.error ?? unreadResult.error, "Could not load notifications.");
       return;
     }
     response.status(200).json({
-      notifications: (data ?? []).map((item) => ({
+      unreadCount: unreadResult.count ?? 0,
+      notifications: (notificationsResult.data ?? []).map((item) => ({
         id: item.id,
         type: item.type,
         title: item.title,
@@ -354,26 +366,30 @@ router.get("/notifications", async (request, response) => {
       })),
     });
   } catch (error: unknown) {
-    handleError(response, error, "Could not initialize administrator notifications.");
+    handleError(response, error, "Could not initialize notifications.");
   }
 });
 
 router.patch("/notifications/read", async (request, response) => {
-  if (!canViewAdminSales(request, response)) return;
+  const user = request.flexbarUser;
+  if (!user) {
+    response.status(401).json({ error: "Please sign in to update your notifications." });
+    return;
+  }
   try {
     const admin = createSupabaseAdminClient();
     const { error } = await admin
       .from("notifications")
       .update({ read_at: new Date().toISOString() })
-      .eq("user_id", request.flexbarUser?.id ?? "")
+      .eq("user_id", user.id)
       .is("read_at", null);
     if (error) {
-      handleError(response, error, "Could not mark administrator notifications as read.");
+      handleError(response, error, "Could not mark notifications as read.");
       return;
     }
     response.status(200).json({ message: "Notifications marked as read." });
   } catch (error: unknown) {
-    handleError(response, error, "Could not update administrator notifications.");
+    handleError(response, error, "Could not update notifications.");
   }
 });
 

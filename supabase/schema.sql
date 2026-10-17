@@ -907,10 +907,10 @@ grant execute on function public.receive_department_stock(uuid, uuid) to service
 create table if not exists public.notifications (
   id uuid primary key default gen_random_uuid(),
   user_id uuid not null references public.profiles (id) on delete cascade,
-  type text not null check (type in ('sale')),
+  type text not null check (char_length(trim(type)) between 1 and 80),
   title text not null,
   detail text not null,
-  sale_id uuid not null references public.sales (id) on delete cascade,
+  sale_id uuid references public.sales (id) on delete cascade,
   created_at timestamptz not null default now(),
   read_at timestamptz
 );
@@ -1227,8 +1227,11 @@ create table if not exists public.chat_messages (
   sender_name text not null,
   body text not null check (char_length(body) between 1 and 4000),
   created_at timestamptz not null default now(),
+  delivered_at timestamptz,
   read_at timestamptz
 );
+
+alter table public.chat_messages add column if not exists delivered_at timestamptz;
 
 create index if not exists chat_messages_conversation_created_idx
   on public.chat_messages (conversation_id, created_at desc);

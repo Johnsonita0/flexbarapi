@@ -46,9 +46,10 @@ router.get("/people", async (request, response) => {
   try {
     const admin = createSupabaseAdminClient();
     const { data: people, error } = await admin.from("profiles")
-      .select("id, display_name, role, department_id")
+      .select("id, display_name, role, department_id, avatar_path")
       .eq("is_active", true)
       .eq("is_archived", false)
+      .eq("company_id", user.companyId)
       .neq("id", user.id)
       .order("display_name");
     if (error) {
@@ -69,6 +70,7 @@ router.get("/people", async (request, response) => {
         id: person.id,
         name: person.display_name ?? "Team member",
         role: person.role,
+        avatarPath: person.avatar_path,
         departmentName: person.department_id ? departmentNames.get(person.department_id) ?? "Department" : "Unassigned",
       })),
     });
@@ -102,7 +104,7 @@ router.get("/conversations", async (request, response) => {
     ] = await Promise.all([
       admin.from("chat_conversations").select("id, created_at").in("id", conversationIds),
       admin.from("chat_conversation_participants").select("conversation_id, user_id").in("conversation_id", conversationIds),
-      admin.from("chat_messages").select("id, conversation_id, sender_id, body, created_at").in("conversation_id", conversationIds).order("created_at", { ascending: false }).limit(500),
+      admin.from("chat_messages").select("id, conversation_id, sender_id, body, created_at, delivered_at").in("conversation_id", conversationIds).order("created_at", { ascending: false }).limit(500),
       admin.from("chat_messages").select("conversation_id").in("conversation_id", conversationIds).neq("sender_id", user.id).is("read_at", null).limit(1000),
     ]);
     const failure = conversationsError ?? participantsError ?? messagesError ?? unreadError;
@@ -112,7 +114,7 @@ router.get("/conversations", async (request, response) => {
     }
     const otherUserIds = [...new Set((participants ?? []).map((participant) => participant.user_id).filter((id) => id !== user.id))];
     const { data: profiles, error: profilesError } = otherUserIds.length
-      ? await admin.from("profiles").select("id, display_name, role").in("id", otherUserIds)
+      ? await admin.from("profiles").select("id, display_name, role, avatar_path").in("id", otherUserIds).eq("company_id", user.companyId)
       : { data: [], error: null };
     if (profilesError) {
       sendChatError(response, profilesError, "Could not load conversation participants.");
@@ -132,10 +134,11 @@ router.get("/conversations", async (request, response) => {
       const latest = latestMessageByConversation.get(conversation.id);
       return {
         id: conversation.id,
-        peer: { id: peerLink?.user_id ?? "", name: peer?.display_name ?? "Team member", role: peer?.role ?? "staff" },
+        peer: { id: peerLink?.user_id ?? "", name: peer?.display_name ?? "Team member", role: peer?.role ?? "staff", avatarPath: peer?.avatar_path ?? null },
         lastMessage: latest?.body ?? "",
         lastMessageAt: latest?.created_at ?? conversation.created_at,
         lastMessageFromMe: latest?.sender_id === user.id,
+        lastMessageDeliveredAt: latest?.sender_id === user.id ? latest.delivered_at : null,
         unreadCount: unreadCountByConversation.get(conversation.id) ?? 0,
         lastReadAt: ownReadAt.get(conversation.id) ?? null,
       };
@@ -157,7 +160,7 @@ router.post("/conversations", async (request, response) => {
   try {
     const admin = createSupabaseAdminClient();
     const { data: people, error: peopleError } = await admin.from("profiles")
-      .select("id, is_active, is_archived")
+      .select("id, is_active, is_archived, company_id")
       .in("id", [user.id, peerId]);
     if (peopleError) {
       sendChatError(response, peopleError, "Could not verify conversation participants.");
@@ -165,7 +168,8 @@ router.post("/conversations", async (request, response) => {
     }
     const requesterProfile = (people ?? []).find((profile) => profile.id === user.id);
     const peerProfile = (people ?? []).find((profile) => profile.id === peerId);
-    if (!requesterProfile?.is_active || requesterProfile.is_archived || !peerProfile?.is_active || peerProfile.is_archived) {
+    if (!requesterProfile?.is_active || requesterProfile.is_archived || requesterProfile.company_id !== user.companyId
+      || !peerProfile?.is_active || peerProfile.is_archived || peerProfile.company_id !== user.companyId) {
       response.status(404).json({ error: "That active staff account could not be found." });
       return;
     }
@@ -225,7 +229,7 @@ router.get("/conversations/:conversationId/messages", async (request, response) 
       return;
     }
     const { data: messages, error } = await admin.from("chat_messages")
-      .select("id, sender_id, sender_name, body, created_at")
+      .select("id, sender_id, sender_name, body, created_at, delivered_at")
       .eq("conversation_id", conversationId)
       .order("created_at", { ascending: true })
       .limit(300);
@@ -233,8 +237,9 @@ router.get("/conversations/:conversationId/messages", async (request, response) 
       sendChatError(response, error, "Could not load conversation messages.");
       return;
     }
+    const receivedAt = new Date().toISOString();
     const { error: readError } = await admin.from("chat_messages")
-      .update({ read_at: new Date().toISOString() })
+      .update({ delivered_at: receivedAt, read_at: receivedAt })
       .eq("conversation_id", conversationId)
       .neq("sender_id", user.id)
       .is("read_at", null);
@@ -250,13 +255,24 @@ router.get("/conversations/:conversationId/messages", async (request, response) 
       sendChatError(response, participantError, "Could not update conversation read status.");
       return;
     }
+    const senderIds = [...new Set((messages ?? []).flatMap((message) => message.sender_id ? [message.sender_id] : []))];
+    const { data: senderProfiles, error: senderProfilesError } = senderIds.length
+      ? await admin.from("profiles").select("id, avatar_path").in("id", senderIds).eq("company_id", user.companyId)
+      : { data: [], error: null };
+    if (senderProfilesError) {
+      sendChatError(response, senderProfilesError, "Could not load chat participant photos.");
+      return;
+    }
+    const avatarBySenderId = new Map((senderProfiles ?? []).map((profile) => [profile.id, profile.avatar_path]));
     response.status(200).json({
       messages: (messages ?? []).map((message) => ({
         id: message.id,
         senderId: message.sender_id,
         senderName: message.sender_name,
+        senderAvatarPath: message.sender_id ? avatarBySenderId.get(message.sender_id) ?? null : null,
         body: message.body,
         createdAt: message.created_at,
+        deliveredAt: message.delivered_at,
         fromMe: message.sender_id === user.id,
       })),
     });
@@ -282,19 +298,45 @@ router.post("/conversations/:conversationId/messages", async (request, response)
     }
     const { data, error } = await admin.from("chat_messages")
       .insert({ conversation_id: conversationId, sender_id: user.id, sender_name: user.displayName ?? "Team member", body: body.trim() })
-      .select("id, sender_id, sender_name, body, created_at")
+      .select("id, sender_id, sender_name, body, created_at, delivered_at")
       .single();
     if (error) {
       sendChatError(response, error, "Could not save chat message.");
       return;
     }
+    let notificationWarning = false;
+    const { data: recipients, error: recipientsError } = await admin.from("chat_conversation_participants")
+      .select("user_id")
+      .eq("conversation_id", conversationId)
+      .eq("company_id", user.companyId)
+      .neq("user_id", user.id);
+    if (recipientsError) {
+      notificationWarning = true;
+      console.error("Chat message was sent but recipient notifications could not be loaded.", recipientsError);
+    } else if (recipients?.length) {
+      const { error: notificationError } = await admin.from("notifications").insert(
+        recipients.map((recipient) => ({
+          user_id: recipient.user_id,
+          type: "chat_message",
+          title: `${user.displayName ?? "A colleague"} sent you a message`,
+          detail: "Open Chat to read the new message.",
+        })),
+      );
+      if (notificationError) {
+        notificationWarning = true;
+        console.error("Chat message was sent but recipient notifications could not be saved.", notificationError);
+      }
+    }
     response.status(201).json({
+      notificationWarning,
       message: {
         id: data.id,
         senderId: data.sender_id,
         senderName: data.sender_name,
+        senderAvatarPath: user.avatarPath,
         body: data.body,
         createdAt: data.created_at,
+        deliveredAt: data.delivered_at,
         fromMe: true,
       },
     });
