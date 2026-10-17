@@ -153,6 +153,41 @@ router.post("/", async (request, response) => {
   }
   try {
     const admin = createSupabaseAdminClient();
+    const { data: profiles, error: profilesError } = await admin.from("profiles")
+      .select("id, is_active, is_archived")
+      .in("id", participantIds)
+      .eq("company_id", user.companyId);
+    if (profilesError) {
+      sendCallError(response, profilesError, "Could not verify call participants.");
+      return;
+    }
+    if ((profiles ?? []).length !== participantIds.length || profiles?.some((profile) => !profile.is_active || profile.is_archived)) {
+      response.status(400).json({ error: "One or more selected colleagues are no longer active in your company." });
+      return;
+    }
+
+    const leftAt = new Date().toISOString();
+    const { data: previousRooms, error: previousRoomsError } = await admin.from("call_rooms")
+      .update({ status: "ended", ended_at: leftAt })
+      .eq("company_id", user.companyId)
+      .eq("created_by", user.id)
+      .in("status", ["active", "ringing"])
+      .select("id");
+    if (previousRoomsError) {
+      sendCallError(response, previousRoomsError, "Could not close a previous call before starting a new call.");
+      return;
+    }
+    const previousRoomIds = (previousRooms ?? []).map((room) => room.id);
+    if (previousRoomIds.length) {
+      const { error } = await admin.from("call_room_participants")
+        .update({ status: "left", left_at: leftAt })
+        .in("room_id", previousRoomIds)
+        .in("status", ["ringing", "joined"]);
+      if (error) {
+        sendCallError(response, error, "Could not close participants in a previous call.");
+        return;
+      }
+    }
     const ringingCutoff = new Date(Date.now() - ringingLifetimeMs).toISOString();
     const [activeCallResult, ringingCallResult] = await Promise.all([
       admin.from("call_rooms").select("id").eq("created_by", user.id).eq("status", "active").limit(1).maybeSingle(),
@@ -165,18 +200,6 @@ router.post("/", async (request, response) => {
     }
     if (activeCallResult.data || ringingCallResult.data) {
       response.status(409).json({ error: "End your current call before starting another." });
-      return;
-    }
-    const { data: profiles, error: profilesError } = await admin.from("profiles")
-      .select("id, is_active, is_archived")
-      .in("id", participantIds)
-      .eq("company_id", user.companyId);
-    if (profilesError) {
-      sendCallError(response, profilesError, "Could not verify call participants.");
-      return;
-    }
-    if ((profiles ?? []).length !== participantIds.length || profiles?.some((profile) => !profile.is_active || profile.is_archived)) {
-      response.status(400).json({ error: "One or more selected colleagues are no longer active in your company." });
       return;
     }
     const { data: room, error: roomError } = await admin.from("call_rooms")
