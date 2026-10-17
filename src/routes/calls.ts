@@ -1,0 +1,357 @@
+import { Router } from "express";
+import type { Request, Response } from "express";
+import { requireUser } from "../auth/requireUser.js";
+import { createSupabaseAdminClient } from "../services/supabaseAdmin.js";
+
+const router = Router();
+const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const ringingLifetimeMs = 5 * 60_000;
+
+function sendCallError(response: Response, error: unknown, context: string) {
+  console.error(context, error);
+  if (error instanceof Error && error.message.includes("Missing required environment variable")) {
+    response.status(503).json({ error: "Calls are not configured yet. Please contact your administrator." });
+    return;
+  }
+  response.status(500).json({ error: "We couldn't complete that call request. Please try again." });
+}
+
+function getUser(request: Request, response: Response) {
+  const user = request.flexbarUser;
+  if (!user) {
+    response.status(401).json({ error: "Please sign in to make or receive calls." });
+    return null;
+  }
+  return user;
+}
+
+function getIceServers() {
+  const iceServers: { urls: string | string[]; username?: string; credential?: string }[] = [
+    { urls: "stun:stun.l.google.com:19302" },
+  ];
+  const turnUrls = process.env.TURN_URLS?.split(",").map((url) => url.trim()).filter(Boolean) ?? [];
+  if (turnUrls.length && process.env.TURN_USERNAME && process.env.TURN_CREDENTIAL) {
+    iceServers.push({
+      urls: turnUrls,
+      username: process.env.TURN_USERNAME,
+      credential: process.env.TURN_CREDENTIAL,
+    });
+  }
+  return {
+    iceServers,
+    turnConfigured: turnUrls.length > 0 && Boolean(process.env.TURN_USERNAME && process.env.TURN_CREDENTIAL),
+  };
+}
+
+router.use(requireUser);
+
+router.post("/", async (request, response) => {
+  const user = getUser(request, response);
+  if (!user) return;
+  const participantIds: unknown = request.body?.participantIds;
+  const mediaMode: unknown = request.body?.mediaMode;
+  if (
+    !Array.isArray(participantIds)
+    || participantIds.length < 1
+    || participantIds.length > 7
+    || participantIds.some((id) => typeof id !== "string" || !uuidPattern.test(id) || id === user.id)
+    || new Set(participantIds).size !== participantIds.length
+    || (mediaMode !== "audio" && mediaMode !== "video")
+  ) {
+    response.status(400).json({ error: "Choose one to seven colleagues and select audio or video calling." });
+    return;
+  }
+  try {
+    const admin = createSupabaseAdminClient();
+    const ringingCutoff = new Date(Date.now() - ringingLifetimeMs).toISOString();
+    const [activeCallResult, ringingCallResult] = await Promise.all([
+      admin.from("call_rooms").select("id").eq("created_by", user.id).eq("status", "active").limit(1).maybeSingle(),
+      admin.from("call_rooms").select("id").eq("created_by", user.id).eq("status", "ringing").gte("created_at", ringingCutoff).limit(1).maybeSingle(),
+    ]);
+    const existingCallError = activeCallResult.error ?? ringingCallResult.error;
+    if (existingCallError) {
+      sendCallError(response, existingCallError, "Could not check for an existing call.");
+      return;
+    }
+    if (activeCallResult.data || ringingCallResult.data) {
+      response.status(409).json({ error: "End your current call before starting another." });
+      return;
+    }
+    const { data: profiles, error: profilesError } = await admin.from("profiles")
+      .select("id, is_active, is_archived")
+      .in("id", participantIds)
+      .eq("company_id", user.companyId);
+    if (profilesError) {
+      sendCallError(response, profilesError, "Could not verify call participants.");
+      return;
+    }
+    if ((profiles ?? []).length !== participantIds.length || profiles?.some((profile) => !profile.is_active || profile.is_archived)) {
+      response.status(400).json({ error: "One or more selected colleagues are no longer active in your company." });
+      return;
+    }
+    const { data: room, error: roomError } = await admin.from("call_rooms")
+      .insert({ company_id: user.companyId, created_by: user.id, media_mode: mediaMode })
+      .select("id")
+      .single();
+    if (roomError) {
+      sendCallError(response, roomError, "Could not create a call room.");
+      return;
+    }
+    const { error: participantsError } = await admin.from("call_room_participants").insert([
+      { room_id: room.id, user_id: user.id, status: "joined", joined_at: new Date().toISOString() },
+      ...participantIds.map((userId: string) => ({ room_id: room.id, user_id: userId, status: "ringing" })),
+    ]);
+    if (participantsError) {
+      const { error: cleanupError } = await admin.from("call_rooms").delete().eq("id", room.id);
+      if (cleanupError) console.error("Could not clean up a call room after invitation failure.", cleanupError);
+      sendCallError(response, participantsError, "Could not invite call participants.");
+      return;
+    }
+    response.status(201).json({ callId: room.id });
+  } catch (error: unknown) {
+    sendCallError(response, error, "Could not initialize call creation.");
+  }
+});
+
+router.get("/invitations", async (request, response) => {
+  const user = getUser(request, response);
+  if (!user) return;
+  try {
+    const admin = createSupabaseAdminClient();
+    const { data: invitations, error } = await admin.from("call_room_participants")
+      .select("room_id, invited_at")
+      .eq("user_id", user.id)
+      .eq("status", "ringing")
+      .order("invited_at", { ascending: false })
+      .limit(10);
+    if (error) {
+      sendCallError(response, error, "Could not load incoming calls.");
+      return;
+    }
+    const roomIds = [...new Set((invitations ?? []).map((invite) => invite.room_id))];
+    if (!roomIds.length) {
+      response.status(200).json({ invitations: [] });
+      return;
+    }
+    const { data: rooms, error: roomsError } = await admin.from("call_rooms")
+      .select("id, created_by, media_mode, created_at, status")
+      .in("id", roomIds)
+      .eq("company_id", user.companyId)
+      .in("status", ["ringing", "active"]);
+    if (roomsError) {
+      sendCallError(response, roomsError, "Could not load incoming call details.");
+      return;
+    }
+    const callerIds = [...new Set((rooms ?? []).map((room) => room.created_by))];
+    const { data: callers, error: callersError } = callerIds.length
+      ? await admin.from("profiles").select("id, display_name").in("id", callerIds)
+      : { data: [], error: null };
+    if (callersError) {
+      sendCallError(response, callersError, "Could not load call initiator details.");
+      return;
+    }
+    const callerNames = new Map((callers ?? []).map((profile) => [profile.id, profile.display_name ?? "Team member"]));
+    response.status(200).json({
+      invitations: (rooms ?? [])
+        .filter((room) => room.status === "active" || Date.now() - Date.parse(room.created_at) < ringingLifetimeMs)
+        .map((room) => ({
+          id: room.id,
+          callerName: callerNames.get(room.created_by) ?? "Team member",
+          mediaMode: room.media_mode,
+          createdAt: room.created_at,
+        })),
+    });
+  } catch (error: unknown) {
+    sendCallError(response, error, "Could not initialize incoming calls.");
+  }
+});
+
+router.get("/:callId", async (request, response) => {
+  const user = getUser(request, response);
+  if (!user) return;
+  const callId = request.params.callId;
+  if (!callId || !uuidPattern.test(callId)) {
+    response.status(400).json({ error: "Choose a valid call." });
+    return;
+  }
+  try {
+    const admin = createSupabaseAdminClient();
+    const { data: membership, error: membershipError } = await admin.from("call_room_participants")
+      .select("status")
+      .eq("room_id", callId)
+      .eq("user_id", user.id)
+      .maybeSingle();
+    if (membershipError) {
+      sendCallError(response, membershipError, "Could not verify call access.");
+      return;
+    }
+    if (!membership || membership.status === "left") {
+      response.status(403).json({ error: "You are not invited to this call." });
+      return;
+    }
+    const { data: room, error: roomError } = await admin.from("call_rooms")
+      .select("id, created_by, company_id, media_mode, status, created_at")
+      .eq("id", callId)
+      .eq("company_id", user.companyId)
+      .maybeSingle();
+    if (roomError) {
+      sendCallError(response, roomError, "Could not load the call.");
+      return;
+    }
+    if (!room || room.status === "ended" || (room.status === "ringing" && Date.now() - Date.parse(room.created_at) > ringingLifetimeMs)) {
+      response.status(410).json({ error: "This call has ended or its invitation expired." });
+      return;
+    }
+    const { data: memberships, error: membershipsError } = await admin.from("call_room_participants")
+      .select("user_id, status")
+      .eq("room_id", callId)
+      .in("status", ["joined", "ringing"]);
+    if (membershipsError) {
+      sendCallError(response, membershipsError, "Could not load the call participants.");
+      return;
+    }
+    const ids = [...new Set((memberships ?? []).map((item) => item.user_id))];
+    const { data: profiles, error: profilesError } = await admin.from("profiles")
+      .select("id, display_name, role, avatar_path")
+      .in("id", ids)
+      .eq("company_id", user.companyId);
+    if (profilesError) {
+      sendCallError(response, profilesError, "Could not load call participant profiles.");
+      return;
+    }
+    const profileById = new Map((profiles ?? []).map((profile) => [profile.id, profile]));
+    response.status(200).json({
+      call: { id: room.id, mediaMode: room.media_mode, status: room.status, isCaller: room.created_by === user.id },
+      user: { id: user.id, name: user.displayName ?? "Team member", role: user.role, avatarPath: user.avatarPath },
+      participants: (memberships ?? []).flatMap((item) => {
+        const profile = profileById.get(item.user_id);
+        return profile ? [{
+          id: profile.id,
+          name: profile.display_name ?? "Team member",
+          role: profile.role,
+          avatarPath: profile.avatar_path,
+          status: item.status,
+        }] : [];
+      }),
+      ...getIceServers(),
+    });
+  } catch (error: unknown) {
+    sendCallError(response, error, "Could not initialize the call room.");
+  }
+});
+
+router.patch("/:callId/:action", async (request, response) => {
+  const user = getUser(request, response);
+  if (!user) return;
+  const { callId, action } = request.params;
+  if (!callId || !uuidPattern.test(callId) || !["join", "decline", "leave", "end"].includes(action ?? "")) {
+    response.status(400).json({ error: "Choose a valid call action." });
+    return;
+  }
+  try {
+    const admin = createSupabaseAdminClient();
+    const { data: membership, error: membershipError } = await admin.from("call_room_participants")
+      .select("status")
+      .eq("room_id", callId)
+      .eq("user_id", user.id)
+      .maybeSingle();
+    if (membershipError) {
+      sendCallError(response, membershipError, "Could not verify call participation.");
+      return;
+    }
+    if (!membership || (membership.status === "left" && action !== "end")) {
+      response.status(403).json({ error: "You are not invited to this call." });
+      return;
+    }
+    const { data: room, error: roomError } = await admin.from("call_rooms")
+      .select("id, created_by, status, created_at")
+      .eq("id", callId)
+      .eq("company_id", user.companyId)
+      .maybeSingle();
+    if (roomError) {
+      sendCallError(response, roomError, "Could not verify the call.");
+      return;
+    }
+    if (!room) {
+      response.status(404).json({ error: "This call could not be found." });
+      return;
+    }
+    if (action === "end") {
+      if (room.created_by !== user.id) {
+        response.status(403).json({ error: "Only the call initiator can end the call for everyone." });
+        return;
+      }
+      const { error } = await admin.from("call_rooms")
+        .update({ status: "ended", ended_at: new Date().toISOString() })
+        .eq("id", callId);
+      if (error) {
+        sendCallError(response, error, "Could not end the call.");
+        return;
+      }
+      const { error: participantsError } = await admin.from("call_room_participants")
+        .update({ status: "left", left_at: new Date().toISOString() })
+        .eq("room_id", callId)
+        .in("status", ["ringing", "joined"]);
+      if (participantsError) {
+        sendCallError(response, participantsError, "Could not notify participants that the call ended.");
+        return;
+      }
+      response.status(200).json({ ok: true });
+      return;
+    }
+    if (action === "join" && room.status === "ringing" && Date.now() - Date.parse(room.created_at) > ringingLifetimeMs) {
+      response.status(410).json({ error: "This call invitation has expired." });
+      return;
+    }
+    const status = action === "join" ? "joined" : "left";
+    const participationUpdate = action === "join"
+      ? { status, joined_at: new Date().toISOString(), left_at: null }
+      : { status, left_at: new Date().toISOString() };
+    const { data: updated, error: updateError } = await admin.from("call_room_participants")
+      .update(participationUpdate)
+      .eq("room_id", callId)
+      .eq("user_id", user.id)
+      .in("status", action === "join" ? ["ringing", "joined"] : ["ringing", "joined"])
+      .select("room_id")
+      .maybeSingle();
+    if (updateError) {
+      sendCallError(response, updateError, "Could not update call participation.");
+      return;
+    }
+    if (!updated) {
+      response.status(403).json({ error: "You are not invited to this call." });
+      return;
+    }
+    if (action === "join") {
+      const { error } = await admin.from("call_rooms").update({ status: "active" }).eq("id", callId).eq("status", "ringing");
+      if (error) {
+        sendCallError(response, error, "Could not activate the call.");
+        return;
+      }
+    } else {
+      const { data: activeMembers, error } = await admin.from("call_room_participants")
+        .select("user_id")
+        .eq("room_id", callId)
+        .eq("status", "joined")
+        .limit(1);
+      if (error) {
+        sendCallError(response, error, "Could not check remaining call participants.");
+        return;
+      }
+      if (!activeMembers?.length) {
+        const { error: endError } = await admin.from("call_rooms")
+          .update({ status: "ended", ended_at: new Date().toISOString() })
+          .eq("id", callId);
+        if (endError) {
+          sendCallError(response, endError, "Could not close the call after its final participant left.");
+          return;
+        }
+      }
+    }
+    response.status(200).json({ ok: true });
+  } catch (error: unknown) {
+    sendCallError(response, error, "Could not update the call.");
+  }
+});
+
+export { router as callsRouter };

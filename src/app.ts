@@ -8,6 +8,7 @@ import { inventoryRouter } from "./routes/inventory.js";
 import { salesRouter } from "./routes/sales.js";
 import { departmentRouter } from "./routes/department.js";
 import { chatRouter } from "./routes/chat.js";
+import { callsRouter } from "./routes/calls.js";
 
 const app = express();
 const allowedOrigins = (process.env.FRONTEND_ORIGINS ?? "http://localhost:5173")
@@ -63,6 +64,7 @@ app.use("/api/v1/inventory", inventoryRouter);
 app.use("/api/v1/sales", salesRouter);
 app.use("/api/v1/department", departmentRouter);
 app.use("/api/v1/chat", chatRouter);
+app.use("/api/v1/calls", callsRouter);
 
 app.use((error: unknown, _request: express.Request, response: express.Response, _next: express.NextFunction) => {
   console.error("Unhandled API request error.", error);
