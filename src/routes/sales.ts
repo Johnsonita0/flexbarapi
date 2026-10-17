@@ -393,6 +393,34 @@ router.patch("/notifications/read", async (request, response) => {
   }
 });
 
+router.patch("/notifications/:notificationId/read", async (request, response) => {
+  const user = request.flexbarUser;
+  const notificationId = request.params.notificationId;
+  if (!user) {
+    response.status(401).json({ error: "Please sign in to update your notifications." });
+    return;
+  }
+  if (!notificationId || !uuidPattern.test(notificationId)) {
+    response.status(400).json({ error: "Choose a valid notification." });
+    return;
+  }
+  try {
+    const admin = createSupabaseAdminClient();
+    const { error } = await admin
+      .from("notifications")
+      .update({ read_at: new Date().toISOString() })
+      .eq("id", notificationId)
+      .eq("user_id", user.id);
+    if (error) {
+      handleError(response, error, "Could not mark the notification as read.");
+      return;
+    }
+    response.status(200).json({ message: "Notification marked as read." });
+  } catch (error: unknown) {
+    handleError(response, error, "Could not update the notification.");
+  }
+});
+
 router.get("/handover-options", async (request, response) => {
   const user = request.flexbarUser;
   const departmentId = userDepartment(request, response);
