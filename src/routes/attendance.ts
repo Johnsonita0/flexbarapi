@@ -77,12 +77,14 @@ async function loadBusinessSettings() {
 
 router.use(requireUser);
 
-router.get("/config", async (_request, response) => {
+router.get("/config", async (request, response) => {
   try {
     const settings = await loadBusinessSettings();
+    const canViewCoordinates = request.flexbarUser?.role === "super_admin";
+    response.set("Cache-Control", "no-store");
     response.status(200).json({
-      latitude: settings.latitude,
-      longitude: settings.longitude,
+      latitude: canViewCoordinates ? settings.latitude : null,
+      longitude: canViewCoordinates ? settings.longitude : null,
       radiusMeters: settings.geofence_radius_m,
       timezone: settings.timezone,
       configured: settings.latitude !== null && settings.longitude !== null,

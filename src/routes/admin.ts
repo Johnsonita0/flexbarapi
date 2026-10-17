@@ -15,7 +15,17 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function frontendRedirect(request: Request, query: string): string | undefined {
-  const base = request.get("origin") ?? process.env.FRONTEND_URL;
+  const configuredBase = process.env.FRONTEND_URL;
+  const fallbackBase = process.env.VERCEL
+    ? "https://flaxbarmanagement.vercel.app"
+    : "http://localhost:5173";
+  const base = configuredBase
+    ? new URL(configuredBase).hostname === "localhost" || new URL(configuredBase).hostname === "127.0.0.1"
+      ? fallbackBase
+      : configuredBase
+    : process.env.VERCEL
+      ? fallbackBase
+      : request.get("origin") ?? fallbackBase;
   if (!base) return undefined;
   const redirect = new URL(base);
   redirect.pathname = "/";
@@ -298,9 +308,10 @@ router.post("/users", requireSuperAdmin, async (request, response) => {
     !isRecord(request.body) ||
     typeof request.body.email !== "string" ||
     typeof request.body.displayName !== "string" ||
-    typeof request.body.role !== "string"
+    typeof request.body.role !== "string" ||
+    typeof request.body.password !== "string"
   ) {
-    response.status(400).json({ error: "Enter the new user’s name, email, and role." });
+    response.status(400).json({ error: "Enter the new staff member’s name, email, role, and initial password." });
     return;
   }
   const email = request.body.email.trim().toLowerCase();
@@ -313,6 +324,10 @@ router.post("/users", requireSuperAdmin, async (request, response) => {
   }
   if (displayName.length < 2 || displayName.length > 100) {
     response.status(400).json({ error: "Names must be between 2 and 100 characters." });
+    return;
+  }
+  if (request.body.password.length < 8 || request.body.password.length > 128) {
+    response.status(400).json({ error: "Passwords must be between 8 and 128 characters." });
     return;
   }
   if (!isAppRole(role) || role === "super_admin") {
@@ -342,21 +357,22 @@ router.post("/users", requireSuperAdmin, async (request, response) => {
       }
     }
 
-    const redirectTo = frontendRedirect(request, "?invite=1");
-    const { data: invitation, error: invitationError } = await admin.auth.admin.inviteUserByEmail(email, {
-      data: { display_name: displayName },
-      ...(redirectTo ? { redirectTo } : {}),
+    const { data: createdAccount, error: createError } = await admin.auth.admin.createUser({
+      email,
+      password: request.body.password,
+      email_confirm: true,
+      user_metadata: { display_name: displayName },
     });
-    if (invitationError) {
-      if (invitationError.message.toLowerCase().includes("already been registered")) {
+    if (createError) {
+      if (createError.message.toLowerCase().includes("already been registered")) {
         response.status(409).json({ error: "An account already exists for that email address." });
         return;
       }
-      sendAdminError(response, invitationError, "Could not invite the new user.");
+      sendAdminError(response, createError, "Could not create the new staff account.");
       return;
     }
-    if (!invitation.user) {
-      response.status(502).json({ error: "The invitation could not be confirmed. Check the user list before retrying." });
+    if (!createdAccount.user) {
+      response.status(502).json({ error: "The staff account could not be confirmed. Check the user list before retrying." });
       return;
     }
 
@@ -368,31 +384,31 @@ router.post("/users", requireSuperAdmin, async (request, response) => {
         department_id: departmentId ?? null,
         is_active: true,
       })
-      .eq("id", invitation.user.id);
+      .eq("id", createdAccount.user.id);
     if (profileError) {
-      console.error("Invited user, but could not save the user's workspace role.", profileError);
-      response.status(502).json({ error: "The invitation was sent, but the workspace role could not be saved. Contact your administrator before retrying." });
+      console.error("Created staff account, but could not save the user's workspace role.", profileError);
+      response.status(502).json({ error: "The staff account was created, but its workspace role could not be saved. Contact your administrator before retrying." });
       return;
     }
 
     const actor = request.flexbarUser;
     if (!actor) {
-      response.status(401).json({ error: "Please sign in to manage invitations." });
+      response.status(401).json({ error: "Please sign in to manage staff accounts." });
       return;
     }
     await recordAdminActivity(admin, {
       actorId: actor.id,
       actorName: actor.displayName ?? actor.email ?? "Super Admin",
       actorEmail: actor.email,
-      action: "user.invited",
+      action: "user.created",
       targetType: "user",
-      targetId: invitation.user.id,
+      targetId: createdAccount.user.id,
       targetLabel: displayName,
       details: { email, role, departmentId: departmentId ?? null },
     });
-    response.status(201).json({ message: "Invitation sent. The user can set their password from the email link." });
+    response.status(201).json({ message: "Staff account created. Share the initial password with them securely." });
   } catch (error: unknown) {
-    sendAdminError(response, error, "Could not initialize user invitation.");
+    sendAdminError(response, error, "Could not initialize staff account creation.");
   }
 });
 

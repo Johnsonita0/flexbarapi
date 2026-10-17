@@ -4,6 +4,7 @@ import { requireUser } from "./auth/requireUser.js";
 import { attendanceRouter } from "./routes/attendance.js";
 import { adminRouter } from "./routes/admin.js";
 import { profileRouter } from "./routes/profile.js";
+import { inventoryRouter } from "./routes/inventory.js";
 
 const app = express();
 const allowedOrigins = (process.env.FRONTEND_ORIGINS ?? "http://localhost:5173")
@@ -22,7 +23,7 @@ app.use(
       callback(new Error("This origin is not allowed to access the Flex Bar API."));
     },
     allowedHeaders: ["Authorization", "Content-Type"],
-    methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   }),
 );
 app.use(express.json({ limit: "1mb" }));
@@ -50,6 +51,7 @@ app.get("/api/v1/me", requireUser, (request, response) => {
 app.use("/api/v1/admin", adminRouter);
 app.use("/api/v1/attendance", attendanceRouter);
 app.use("/api/v1/profile", profileRouter);
+app.use("/api/v1/inventory", inventoryRouter);
 
 app.use((error: unknown, _request: express.Request, response: express.Response, _next: express.NextFunction) => {
   console.error("Unhandled API request error.", error);
