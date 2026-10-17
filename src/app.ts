@@ -5,6 +5,9 @@ import { attendanceRouter } from "./routes/attendance.js";
 import { adminRouter } from "./routes/admin.js";
 import { profileRouter } from "./routes/profile.js";
 import { inventoryRouter } from "./routes/inventory.js";
+import { salesRouter } from "./routes/sales.js";
+import { departmentRouter } from "./routes/department.js";
+import { chatRouter } from "./routes/chat.js";
 
 const app = express();
 const allowedOrigins = (process.env.FRONTEND_ORIGINS ?? "http://localhost:5173")
@@ -44,6 +47,8 @@ app.get("/api/v1/me", requireUser, (request, response) => {
     displayName: request.flexbarUser.displayName,
     avatarPath: request.flexbarUser.avatarPath,
     hasLockPin: request.flexbarUser.hasLockPin,
+    departmentId: request.flexbarUser.departmentId,
+    salesEnabled: request.flexbarUser.salesEnabled,
     role: request.flexbarUser.role,
   });
 });
@@ -52,6 +57,9 @@ app.use("/api/v1/admin", adminRouter);
 app.use("/api/v1/attendance", attendanceRouter);
 app.use("/api/v1/profile", profileRouter);
 app.use("/api/v1/inventory", inventoryRouter);
+app.use("/api/v1/sales", salesRouter);
+app.use("/api/v1/department", departmentRouter);
+app.use("/api/v1/chat", chatRouter);
 
 app.use((error: unknown, _request: express.Request, response: express.Response, _next: express.NextFunction) => {
   console.error("Unhandled API request error.", error);

@@ -10,6 +10,8 @@ declare global {
         avatarPath: string | null;
         hasLockPin: boolean;
         isArchived: boolean;
+        departmentId: string | null;
+        salesEnabled: boolean;
         role: AppRole;
       };
     }

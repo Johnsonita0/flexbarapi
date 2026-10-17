@@ -9,6 +9,7 @@ import { createSupabaseAdminClient } from "../services/supabaseAdmin.js";
 const router = Router();
 const primaryAdminId = "9668b2c5-428f-4d38-a29f-b5de8aa3d6b0";
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const nonSellingDepartmentPattern = /\b(management|admin|administration|kitchen|inventory|store|cleaning|maintenance|security|finance|human resources|operations|laundry)\b/i;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -186,24 +187,44 @@ router.get("/departments", async (_request, response) => {
     const [{ data, error }, { data: profiles, error: profileError }] = await Promise.all([
       admin
       .from("departments")
-      .select("id, name, created_at")
+      .select("id, name, sales_enabled, head_user_id, created_at")
       .order("name"),
-      admin.from("profiles").select("department_id"),
+      admin.from("profiles").select("id, department_id, display_name, role, is_active, is_archived").eq("is_archived", false).order("display_name"),
     ]);
     if (error || profileError) {
       sendAdminError(response, error ?? profileError, "Could not load departments.");
       return;
     }
     const staffCounts = new Map<string, number>();
+    const membersByDepartment = new Map<string, Array<{
+      id: string;
+      name: string;
+      role: string;
+      isActive: boolean;
+    }>>();
     for (const profile of profiles ?? []) {
       if (profile.department_id) {
         staffCounts.set(profile.department_id, (staffCounts.get(profile.department_id) ?? 0) + 1);
+        membersByDepartment.set(profile.department_id, [
+          ...(membersByDepartment.get(profile.department_id) ?? []),
+          {
+            id: profile.id,
+            name: profile.display_name ?? "Team member",
+            role: profile.role,
+            isActive: profile.is_active,
+          },
+        ]);
       }
     }
     response.status(200).json({
       departments: (data ?? []).map((department) => ({
         ...department,
+        salesEnabled: department.sales_enabled,
         staffCount: staffCounts.get(department.id) ?? 0,
+        members: membersByDepartment.get(department.id) ?? [],
+        headUserId: department.head_user_id,
+        headName: membersByDepartment.get(department.id)?.find((member) => member.id === department.head_user_id)?.name ?? null,
+        salesEligible: !nonSellingDepartmentPattern.test(department.name),
       })),
     });
   } catch (error: unknown) {
@@ -255,6 +276,191 @@ router.post("/departments", requireSuperAdmin, async (request, response) => {
     response.status(201).json({ department: data });
   } catch (error: unknown) {
     sendAdminError(response, error, "Could not initialize department creation.");
+  }
+});
+
+router.patch("/departments/:departmentId", requireSuperAdmin, async (request, response) => {
+  const { departmentId } = request.params;
+  if (typeof departmentId !== "string" || !uuidPattern.test(departmentId) || !isRecord(request.body) || typeof request.body.name !== "string") {
+    response.status(400).json({ error: "Enter a valid department name." });
+    return;
+  }
+  const name = request.body.name.trim();
+  if (name.length < 2 || name.length > 80) {
+    response.status(400).json({ error: "Department names must be between 2 and 80 characters." });
+    return;
+  }
+  const actor = request.flexbarUser;
+  if (!actor) {
+    response.status(401).json({ error: "Please sign in to rename departments." });
+    return;
+  }
+
+  try {
+    const admin = createSupabaseAdminClient();
+    const { data, error } = await admin
+      .from("departments")
+      .update({
+        name,
+        ...(nonSellingDepartmentPattern.test(name)
+          ? { sales_enabled: false }
+          : ["bar", "restaurant floor", "cashier"].includes(name.toLowerCase())
+            ? { sales_enabled: true }
+            : {}),
+      })
+      .eq("id", departmentId)
+      .select("id, name, sales_enabled")
+      .maybeSingle();
+    if (error?.code === "23505") {
+      response.status(409).json({ error: "A department with that name already exists." });
+      return;
+    }
+    if (error) {
+      sendAdminError(response, error, "Could not rename department.");
+      return;
+    }
+    if (!data) {
+      response.status(404).json({ error: "That department could not be found." });
+      return;
+    }
+    await recordAdminActivity(admin, {
+      actorId: actor.id,
+      actorName: actor.displayName ?? actor.email ?? "Super Admin",
+      actorEmail: actor.email,
+      action: "department.renamed",
+      targetType: "department",
+      targetId: data.id,
+      targetLabel: data.name,
+      details: { name: data.name, salesEnabled: data.sales_enabled },
+    });
+    response.status(200).json({ department: { id: data.id, name: data.name, salesEnabled: data.sales_enabled } });
+  } catch (error: unknown) {
+    sendAdminError(response, error, "Could not initialize department rename.");
+  }
+});
+
+router.patch("/departments/:departmentId/head", requireSuperAdmin, async (request, response) => {
+  const { departmentId } = request.params;
+  const headUserId = isRecord(request.body) ? request.body.headUserId : undefined;
+  if (
+    typeof departmentId !== "string" || !uuidPattern.test(departmentId) ||
+    (headUserId !== null && (typeof headUserId !== "string" || !uuidPattern.test(headUserId)))
+  ) {
+    response.status(400).json({ error: "Choose a valid department and department head." });
+    return;
+  }
+  const actor = request.flexbarUser;
+  if (!actor) {
+    response.status(401).json({ error: "Please sign in to assign a department head." });
+    return;
+  }
+
+  try {
+    const admin = createSupabaseAdminClient();
+    let headName: string | null = null;
+    if (headUserId) {
+      const { data: member, error: memberError } = await admin
+        .from("profiles")
+        .select("id, department_id, display_name, is_active, is_archived")
+        .eq("id", headUserId)
+        .maybeSingle();
+      if (memberError) {
+        sendAdminError(response, memberError, "Could not verify the department head.");
+        return;
+      }
+      if (!member || member.department_id !== departmentId || !member.is_active || member.is_archived) {
+        response.status(400).json({ error: "Department head must be an active member of this department." });
+        return;
+      }
+      headName = member.display_name ?? "Team member";
+    }
+    const { data, error } = await admin
+      .from("departments")
+      .update({ head_user_id: headUserId })
+      .eq("id", departmentId)
+      .select("id, name, head_user_id")
+      .maybeSingle();
+    if (error) {
+      sendAdminError(response, error, "Could not assign department head.");
+      return;
+    }
+    if (!data) {
+      response.status(404).json({ error: "That department could not be found." });
+      return;
+    }
+    await recordAdminActivity(admin, {
+      actorId: actor.id,
+      actorName: actor.displayName ?? actor.email ?? "Super Admin",
+      actorEmail: actor.email,
+      action: "department.head_assigned",
+      targetType: "department",
+      targetId: data.id,
+      targetLabel: data.name,
+      details: { headUserId: data.head_user_id, headName },
+    });
+    response.status(200).json({ department: { id: data.id, name: data.name, headUserId: data.head_user_id, headName } });
+  } catch (error: unknown) {
+    sendAdminError(response, error, "Could not initialize department head assignment.");
+  }
+});
+
+router.patch("/departments/:departmentId/sales", requireSuperAdmin, async (request, response) => {
+  const { departmentId } = request.params;
+  if (typeof departmentId !== "string" || !uuidPattern.test(departmentId) || !isRecord(request.body) || typeof request.body.salesEnabled !== "boolean") {
+    response.status(400).json({ error: "Choose a department and a valid sales access setting." });
+    return;
+  }
+  try {
+    const admin = createSupabaseAdminClient();
+    const { data: department, error: departmentError } = await admin
+      .from("departments")
+      .select("id, name")
+      .eq("id", departmentId)
+      .maybeSingle();
+    if (departmentError) {
+      sendAdminError(response, departmentError, "Could not verify department sales eligibility.");
+      return;
+    }
+    if (!department) {
+      response.status(404).json({ error: "That department could not be found." });
+      return;
+    }
+    if (request.body.salesEnabled && nonSellingDepartmentPattern.test(department.name)) {
+      response.status(400).json({ error: "Management, kitchen, inventory, cleaning, and other non-customer-facing departments cannot record sales." });
+      return;
+    }
+    const { data, error } = await admin
+      .from("departments")
+      .update({ sales_enabled: request.body.salesEnabled })
+      .eq("id", departmentId)
+      .select("id, name, sales_enabled")
+      .maybeSingle();
+    if (error) {
+      sendAdminError(response, error, "Could not update department sales access.");
+      return;
+    }
+    if (!data) {
+      response.status(404).json({ error: "That department could not be found." });
+      return;
+    }
+    const actor = request.flexbarUser;
+    if (!actor) {
+      response.status(401).json({ error: "Please sign in to manage departments." });
+      return;
+    }
+    await recordAdminActivity(admin, {
+      actorId: actor.id,
+      actorName: actor.displayName ?? actor.email ?? "Super Admin",
+      actorEmail: actor.email,
+      action: "department.sales_access_updated",
+      targetType: "department",
+      targetId: data.id,
+      targetLabel: data.name,
+      details: { salesEnabled: data.sales_enabled },
+    });
+    response.status(200).json({ department: { id: data.id, name: data.name, salesEnabled: data.sales_enabled } });
+  } catch (error: unknown) {
+    sendAdminError(response, error, "Could not initialize department sales access update.");
   }
 });
 

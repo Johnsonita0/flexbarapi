@@ -42,7 +42,7 @@ export async function requireUser(
 
   const { data: profile, error: profileError } = await supabase
     .from("profiles")
-    .select("display_name, avatar_path, role, is_active, is_archived, lock_pin_hash")
+    .select("display_name, avatar_path, role, is_active, is_archived, lock_pin_hash, department_id")
     .eq("id", user.id)
     .single();
 
@@ -65,6 +65,21 @@ export async function requireUser(
     return;
   }
 
+  let salesEnabled = false;
+  if (typeof profile.department_id === "string") {
+    const { data: department, error: departmentError } = await supabase
+      .from("departments")
+      .select("sales_enabled")
+      .eq("id", profile.department_id)
+      .maybeSingle();
+    if (departmentError) {
+      console.error("Could not load the authenticated user's department access.", departmentError);
+      response.status(500).json({ error: "We couldn't load your department access. Please try again or contact your administrator." });
+      return;
+    }
+    salesEnabled = department?.sales_enabled === true;
+  }
+
   request.flexbarUser = {
     id: user.id,
     email: user.email ?? null,
@@ -74,6 +89,8 @@ export async function requireUser(
       typeof profile.avatar_path === "string" ? profile.avatar_path : null,
     hasLockPin: typeof profile.lock_pin_hash === "string",
     isArchived: profile.is_archived,
+    departmentId: typeof profile.department_id === "string" ? profile.department_id : null,
+    salesEnabled,
     role: profile.role,
   };
   next();
