@@ -45,6 +45,96 @@ function getIceServers() {
 
 router.use(requireUser);
 
+router.post("/signout", async (request, response) => {
+  const user = getUser(request, response);
+  if (!user) return;
+  try {
+    const admin = createSupabaseAdminClient();
+    const leftAt = new Date().toISOString();
+    const { data: ownedRooms, error: ownedRoomsError } = await admin.from("call_rooms")
+      .update({ status: "ended", ended_at: leftAt })
+      .eq("company_id", user.companyId)
+      .eq("created_by", user.id)
+      .in("status", ["active", "ringing"])
+      .select("id");
+    if (ownedRoomsError) {
+      sendCallError(response, ownedRoomsError, "Could not end calls started by the signing-out user.");
+      return;
+    }
+    const ownedRoomIds = (ownedRooms ?? []).map((room) => room.id);
+    if (ownedRoomIds.length) {
+      const { error } = await admin.from("call_room_participants")
+        .update({ status: "left", left_at: leftAt })
+        .in("room_id", ownedRoomIds)
+        .in("status", ["ringing", "joined"]);
+      if (error) {
+        sendCallError(response, error, "Could not close call memberships for calls started by the signing-out user.");
+        return;
+      }
+    }
+
+    const { data: memberships, error: membershipsError } = await admin.from("call_room_participants")
+      .select("room_id")
+      .eq("user_id", user.id)
+      .in("status", ["ringing", "joined"]);
+    if (membershipsError) {
+      sendCallError(response, membershipsError, "Could not find call memberships for the signing-out user.");
+      return;
+    }
+    const candidateRoomIds = [...new Set((memberships ?? [])
+      .map((membership) => membership.room_id)
+      .filter((roomId) => !ownedRoomIds.includes(roomId)))];
+    if (candidateRoomIds.length) {
+      const { data: otherRooms, error: otherRoomsError } = await admin.from("call_rooms")
+        .select("id")
+        .eq("company_id", user.companyId)
+        .in("id", candidateRoomIds)
+        .in("status", ["active", "ringing"]);
+      if (otherRoomsError) {
+        sendCallError(response, otherRoomsError, "Could not verify other active call rooms.");
+        return;
+      }
+      const otherRoomIds = (otherRooms ?? []).map((room) => room.id);
+      if (otherRoomIds.length) {
+        const { error } = await admin.from("call_room_participants")
+          .update({ status: "left", left_at: leftAt })
+          .eq("user_id", user.id)
+          .in("room_id", otherRoomIds)
+          .in("status", ["ringing", "joined"]);
+        if (error) {
+          sendCallError(response, error, "Could not leave calls joined by the signing-out user.");
+          return;
+        }
+        for (const roomId of otherRoomIds) {
+          const { data: remainingMembers, error: remainingMembersError } = await admin.from("call_room_participants")
+            .select("user_id")
+            .eq("room_id", roomId)
+            .eq("status", "joined")
+            .limit(1);
+          if (remainingMembersError) {
+            sendCallError(response, remainingMembersError, "Could not verify remaining call participants.");
+            return;
+          }
+          if (!remainingMembers?.length) {
+            const { error } = await admin.from("call_rooms")
+              .update({ status: "ended", ended_at: leftAt })
+              .eq("id", roomId)
+              .eq("company_id", user.companyId)
+              .in("status", ["active", "ringing"]);
+            if (error) {
+              sendCallError(response, error, "Could not end an empty call room.");
+              return;
+            }
+          }
+        }
+      }
+    }
+    response.status(200).json({ ok: true });
+  } catch (error: unknown) {
+    sendCallError(response, error, "Could not end call sessions during sign-out.");
+  }
+});
+
 router.post("/", async (request, response) => {
   const user = getUser(request, response);
   if (!user) return;
