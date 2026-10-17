@@ -2,6 +2,7 @@ import { createClient } from "@supabase/supabase-js";
 import type { NextFunction, Request, Response } from "express";
 import { getRequiredEnv } from "../config/env.js";
 import { runWithCompany } from "../services/companyContext.js";
+import { getSessionIdFromToken } from "./sessionId.js";
 import { isAppRole } from "./roles.js";
 
 export async function requireUser(
@@ -38,6 +39,27 @@ export async function requireUser(
 
   if (userError || !user) {
     response.status(401).json({ error: "Your sign-in session is invalid or expired." });
+    return;
+  }
+
+  const sessionId = getSessionIdFromToken(token);
+  if (!sessionId) {
+    response.status(401).json({ error: "Your sign-in session is invalid or expired." });
+    return;
+  }
+  const { data: activeSession, error: activeSessionError } = await supabase.rpc("touch_account_device_session", {
+    p_session_id: sessionId,
+  });
+  if (activeSessionError) {
+    console.error("Could not verify the active device session.", activeSessionError);
+    response.status(500).json({ error: "We couldn't verify this device's sign-in session." });
+    return;
+  }
+  if (activeSession !== true) {
+    response.status(401).json({
+      code: "ACCOUNT_SESSION_REPLACED",
+      error: "This account is active on another device. Sign in again on this device if needed.",
+    });
     return;
   }
 

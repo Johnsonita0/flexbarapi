@@ -9,6 +9,7 @@ import { salesRouter } from "./routes/sales.js";
 import { departmentRouter } from "./routes/department.js";
 import { chatRouter } from "./routes/chat.js";
 import { callsRouter } from "./routes/calls.js";
+import { accountSessionRouter } from "./routes/accountSession.js";
 
 const app = express();
 const allowedOrigins = (process.env.FRONTEND_ORIGINS ?? "http://localhost:5173")
@@ -57,6 +58,7 @@ app.get("/api/v1/me", requireUser, (request, response) => {
   });
 });
 
+app.use("/api/v1/session", accountSessionRouter);
 app.use("/api/v1/admin", adminRouter);
 app.use("/api/v1/attendance", attendanceRouter);
 app.use("/api/v1/profile", profileRouter);
