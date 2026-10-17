@@ -146,7 +146,6 @@ router.post("/sales", async (request, response) => {
     const { data: businessSettings, error: settingsError } = await admin
       .from("business_settings")
       .select("timezone")
-      .eq("id", 1)
       .single();
     if (settingsError) {
       handleError(response, settingsError, "Could not verify the business date before recording a sale.");

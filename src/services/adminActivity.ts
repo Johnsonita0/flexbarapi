@@ -22,7 +22,17 @@ export async function recordAdminActivity(
   admin: SupabaseClient,
   entry: AdminActivityEntry,
 ) {
+  const { data: profile, error: profileError } = await admin
+    .from("profiles")
+    .select("company_id")
+    .eq("id", entry.actorId)
+    .single();
+  if (profileError) {
+    console.error("Could not determine the company for an administrator activity event.", profileError);
+    throw new AdminActivityWriteError();
+  }
   const { error } = await admin.from("admin_activity_logs").insert({
+    company_id: profile.company_id,
     actor_id: entry.actorId,
     actor_name: entry.actorName,
     actor_email: entry.actorEmail,

@@ -56,7 +56,7 @@ router.get("/settings", requireSuperAdmin, async (_request, response) => {
     const { data, error } = await admin
       .from("business_settings")
       .select("currency, timezone, opening_time, closing_time, notify_task_assignments, notify_low_stock, notify_sales_updates, notify_new_messages")
-      .eq("id", 1)
+      .eq("company_id", _request.flexbarUser?.companyId)
       .single();
     if (error) {
       sendAdminError(response, error, "Could not load business settings.");
@@ -110,7 +110,7 @@ router.put("/settings", requireSuperAdmin, async (request, response) => {
   try {
     const admin = createSupabaseAdminClient();
     const { error } = await admin.from("business_settings").upsert({
-      id: 1,
+      company_id: request.flexbarUser?.companyId,
       currency,
       timezone,
       opening_time: openingTime,
@@ -120,7 +120,7 @@ router.put("/settings", requireSuperAdmin, async (request, response) => {
       notify_sales_updates: notifications.salesUpdates,
       notify_new_messages: notifications.newMessages,
       updated_at: new Date().toISOString(),
-    });
+    }, { onConflict: "company_id" });
     if (error) {
       sendAdminError(response, error, "Could not save business settings.");
       return;
@@ -157,6 +157,7 @@ router.get("/activity", requireSuperAdmin, async (_request, response) => {
     const { data, error } = await admin
       .from("admin_activity_logs")
       .select("id, actor_name, actor_email, action, target_type, target_id, target_label, details, created_at")
+      .eq("company_id", _request.flexbarUser?.companyId)
       .order("created_at", { ascending: false })
       .limit(100);
     if (error) {
@@ -182,14 +183,19 @@ router.get("/activity", requireSuperAdmin, async (_request, response) => {
 });
 
 router.get("/departments", async (_request, response) => {
+  if (!_request.flexbarUser) {
+    response.status(401).json({ error: "Please sign in to view departments." });
+    return;
+  }
   try {
     const admin = createSupabaseAdminClient();
     const [{ data, error }, { data: profiles, error: profileError }] = await Promise.all([
       admin
       .from("departments")
       .select("id, name, sales_enabled, head_user_id, created_at")
+      .eq("company_id", _request.flexbarUser.companyId)
       .order("name"),
-      admin.from("profiles").select("id, department_id, display_name, role, is_active, is_archived").eq("is_archived", false).order("display_name"),
+      admin.from("profiles").select("id, department_id, display_name, role, is_active, is_archived").eq("company_id", _request.flexbarUser.companyId).eq("is_archived", false).order("display_name"),
     ]);
     if (error || profileError) {
       sendAdminError(response, error ?? profileError, "Could not load departments.");
@@ -247,7 +253,7 @@ router.post("/departments", requireSuperAdmin, async (request, response) => {
     const admin = createSupabaseAdminClient();
     const { data, error } = await admin
       .from("departments")
-      .insert({ name })
+      .insert({ name, company_id: request.flexbarUser?.companyId })
       .select("id, name, created_at")
       .single();
     if (error?.code === "23505") {
@@ -309,6 +315,7 @@ router.patch("/departments/:departmentId", requireSuperAdmin, async (request, re
             : {}),
       })
       .eq("id", departmentId)
+      .eq("company_id", request.flexbarUser?.companyId)
       .select("id, name, sales_enabled")
       .maybeSingle();
     if (error?.code === "23505") {
@@ -363,6 +370,7 @@ router.patch("/departments/:departmentId/head", requireSuperAdmin, async (reques
         .from("profiles")
         .select("id, department_id, display_name, is_active, is_archived")
         .eq("id", headUserId)
+        .eq("company_id", request.flexbarUser?.companyId)
         .maybeSingle();
       if (memberError) {
         sendAdminError(response, memberError, "Could not verify the department head.");
@@ -378,6 +386,7 @@ router.patch("/departments/:departmentId/head", requireSuperAdmin, async (reques
       .from("departments")
       .update({ head_user_id: headUserId })
       .eq("id", departmentId)
+      .eq("company_id", request.flexbarUser?.companyId)
       .select("id, name, head_user_id")
       .maybeSingle();
     if (error) {
@@ -416,6 +425,7 @@ router.patch("/departments/:departmentId/sales", requireSuperAdmin, async (reque
       .from("departments")
       .select("id, name")
       .eq("id", departmentId)
+      .eq("company_id", request.flexbarUser?.companyId)
       .maybeSingle();
     if (departmentError) {
       sendAdminError(response, departmentError, "Could not verify department sales eligibility.");
@@ -567,7 +577,10 @@ router.post("/users", requireSuperAdmin, async (request, response) => {
       email,
       password: request.body.password,
       email_confirm: true,
-      user_metadata: { display_name: displayName },
+      user_metadata: {
+        display_name: displayName,
+        company_id: request.flexbarUser?.companyId,
+      },
     });
     if (createError) {
       if (createError.message.toLowerCase().includes("already been registered")) {

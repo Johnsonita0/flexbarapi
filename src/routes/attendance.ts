@@ -5,6 +5,7 @@ import { AdminActivityWriteError, recordAdminActivity } from "../services/adminA
 import { createSupabaseAdminClient } from "../services/supabaseAdmin.js";
 
 const router = Router();
+const adminRoles = new Set(["super_admin", "management_admin"]);
 
 interface Coordinates {
   latitude: number;
@@ -69,7 +70,6 @@ async function loadBusinessSettings() {
   const { data, error } = await admin
     .from("business_settings")
     .select("latitude, longitude, geofence_radius_m, timezone")
-    .eq("id", 1)
     .single();
   if (error) throw error;
   return data;
@@ -80,7 +80,7 @@ router.use(requireUser);
 router.get("/config", async (request, response) => {
   try {
     const settings = await loadBusinessSettings();
-    const canViewCoordinates = request.flexbarUser?.role === "super_admin";
+    const canViewCoordinates = request.flexbarUser && adminRoles.has(request.flexbarUser.role);
     response.set("Cache-Control", "no-store");
     response.status(200).json({
       latitude: canViewCoordinates ? settings.latitude : null,
@@ -95,8 +95,8 @@ router.get("/config", async (request, response) => {
 });
 
 router.put("/config", async (request, response) => {
-  if (request.flexbarUser?.role !== "super_admin") {
-    response.status(403).json({ error: "Only the super admin can change the business attendance location." });
+  if (!request.flexbarUser || !adminRoles.has(request.flexbarUser.role)) {
+    response.status(403).json({ error: "Only a company administrator can change the business attendance location." });
     return;
   }
   const coordinates = parseCoordinates(request.body);
@@ -116,13 +116,13 @@ router.put("/config", async (request, response) => {
   try {
     const admin = createSupabaseAdminClient();
     const { error } = await admin.from("business_settings").upsert({
-      id: 1,
+      company_id: request.flexbarUser?.companyId,
       latitude: coordinates.latitude,
       longitude: coordinates.longitude,
       geofence_radius_m: radiusMeters,
       timezone,
       updated_at: new Date().toISOString(),
-    });
+    }, { onConflict: "company_id" });
     if (error) {
       sendAttendanceError(response, error, "Could not save attendance settings.");
       return;
@@ -166,7 +166,7 @@ router.get("/records", async (request, response) => {
       .order("work_date", { ascending: false })
       .order("check_in_at", { ascending: false })
       .limit(200);
-    if (user.role !== "super_admin") recordsQuery = recordsQuery.eq("user_id", user.id);
+    if (!adminRoles.has(user.role)) recordsQuery = recordsQuery.eq("user_id", user.id);
     const [{ data: records, error: recordsError }, { data: profiles, error: profilesError }, { data: departments, error: departmentsError }] =
       await Promise.all([
         recordsQuery,

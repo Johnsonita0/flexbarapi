@@ -43,6 +43,9 @@ app.get("/api/v1/me", requireUser, (request, response) => {
 
   response.status(200).json({
     id: request.flexbarUser.id,
+    companyId: request.flexbarUser.companyId,
+    companyName: request.flexbarUser.companyName,
+    businessType: request.flexbarUser.businessType,
     email: request.flexbarUser.email,
     displayName: request.flexbarUser.displayName,
     avatarPath: request.flexbarUser.avatarPath,

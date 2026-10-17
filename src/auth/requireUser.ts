@@ -1,6 +1,7 @@
 import { createClient } from "@supabase/supabase-js";
 import type { NextFunction, Request, Response } from "express";
 import { getRequiredEnv } from "../config/env.js";
+import { runWithCompany } from "../services/companyContext.js";
 import { isAppRole } from "./roles.js";
 
 export async function requireUser(
@@ -42,7 +43,7 @@ export async function requireUser(
 
   const { data: profile, error: profileError } = await supabase
     .from("profiles")
-    .select("display_name, avatar_path, role, is_active, is_archived, lock_pin_hash, department_id")
+    .select("display_name, avatar_path, role, is_active, is_archived, lock_pin_hash, department_id, company_id")
     .eq("id", user.id)
     .single();
 
@@ -64,6 +65,11 @@ export async function requireUser(
     response.status(500).json({ error: "Your account role is not configured correctly." });
     return;
   }
+  if (typeof profile.company_id !== "string") {
+    console.error("The authenticated user's profile has no company workspace.");
+    response.status(403).json({ error: "Your account is not assigned to a company workspace. Please contact your administrator." });
+    return;
+  }
 
   let salesEnabled = false;
   if (typeof profile.department_id === "string") {
@@ -71,6 +77,7 @@ export async function requireUser(
       .from("departments")
       .select("sales_enabled")
       .eq("id", profile.department_id)
+      .eq("company_id", profile.company_id)
       .maybeSingle();
     if (departmentError) {
       console.error("Could not load the authenticated user's department access.", departmentError);
@@ -79,9 +86,20 @@ export async function requireUser(
     }
     salesEnabled = department?.sales_enabled === true;
   }
+  const { data: company, error: companyError } = await supabase
+    .from("companies")
+    .select("name, business_type")
+    .eq("id", profile.company_id)
+    .single();
+  if (companyError) {
+    console.error("Could not load the authenticated user's company workspace.", companyError);
+    response.status(500).json({ error: "We couldn't load your company workspace. Please try again or contact your administrator." });
+    return;
+  }
 
   request.flexbarUser = {
     id: user.id,
+    companyId: profile.company_id,
     email: user.email ?? null,
     displayName:
       typeof profile.display_name === "string" ? profile.display_name : null,
@@ -92,6 +110,8 @@ export async function requireUser(
     departmentId: typeof profile.department_id === "string" ? profile.department_id : null,
     salesEnabled,
     role: profile.role,
+    companyName: company.name,
+    businessType: company.business_type,
   };
-  next();
+  runWithCompany(profile.company_id, next);
 }

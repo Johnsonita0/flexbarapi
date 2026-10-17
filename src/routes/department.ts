@@ -50,7 +50,7 @@ function utcBoundary(date: string, timezone: string) {
 }
 
 async function getBusinessDay(admin: ReturnType<typeof createSupabaseAdminClient>) {
-  const { data, error } = await admin.from("business_settings").select("timezone").eq("id", 1).single();
+  const { data, error } = await admin.from("business_settings").select("timezone").single();
   if (error) throw error;
   const timezone = data.timezone || "Africa/Lagos";
   const date = localDate(timezone);
@@ -403,8 +403,8 @@ router.get("/meetings", async (request, response) => {
     const admin = createSupabaseAdminClient();
     const canViewAll = adminRoles.has(user.role);
     let query = admin.from("department_meetings")
-      .select("id, department_id, title, agenda, starts_at, location, call_mode, created_by, created_at")
-      .gte("starts_at", new Date().toISOString())
+      .select("id, department_id, is_company_wide, title, agenda, starts_at, is_instant, location, call_mode, created_by, created_at")
+      .gte("starts_at", new Date(Date.now() - 8 * 60 * 60_000).toISOString())
       .order("starts_at", { ascending: true })
       .limit(100);
     if (!canViewAll) {
@@ -412,14 +412,14 @@ router.get("/meetings", async (request, response) => {
         response.status(403).json({ error: "Assign your account to a department to view its meetings." });
         return;
       }
-      query = query.eq("department_id", user.departmentId);
+      query = query.or(`department_id.eq.${user.departmentId},is_company_wide.eq.true`);
     }
     const { data: meetings, error } = await query;
     if (error) {
       sendDepartmentError(response, error, "Could not load department meetings.");
       return;
     }
-    const departmentIds = [...new Set((meetings ?? []).map((meeting) => meeting.department_id))];
+    const departmentIds = [...new Set((meetings ?? []).flatMap((meeting) => meeting.department_id ? [meeting.department_id] : []))];
     const creatorIds = [...new Set((meetings ?? []).map((meeting) => meeting.created_by))];
     const [{ data: departments, error: departmentsError }, { data: profiles, error: profilesError }, { data: availableDepartments, error: availableDepartmentsError }] = await Promise.all([
       departmentIds.length ? admin.from("departments").select("id, name").in("id", departmentIds) : Promise.resolve({ data: [], error: null }),
@@ -437,10 +437,11 @@ router.get("/meetings", async (request, response) => {
       meetings: (meetings ?? []).map((meeting) => ({
         id: meeting.id,
         departmentId: meeting.department_id,
-        departmentName: departmentNames.get(meeting.department_id) ?? "Department",
+        departmentName: meeting.is_company_wide ? "All departments" : departmentNames.get(meeting.department_id ?? "") ?? "Department",
         title: meeting.title,
         agenda: meeting.agenda,
         startsAt: meeting.starts_at,
+        isInstant: meeting.is_instant,
         callMode: meeting.call_mode,
         location: meeting.location,
         createdByName: creatorNames.get(meeting.created_by) ?? "Team member",
@@ -461,55 +462,91 @@ router.post("/meetings", async (request, response) => {
     response.status(401).json({ error: "Please sign in to schedule a meeting." });
     return;
   }
-  const { title, agenda, startsAt, location, departmentId, callMode } = request.body ?? {};
+  const { title, agenda, startsAt, location, departmentId, callMode, instant } = request.body ?? {};
+  const isInstant = instant === true;
+  const isCompanyWide = departmentId === "all";
+  const scheduledStartTime = typeof startsAt === "string" ? Date.parse(startsAt) : NaN;
   if (
     typeof title !== "string" || title.trim().length < 3 || title.trim().length > 120 ||
-    typeof agenda !== "string" || agenda.trim().length < 3 || agenda.trim().length > 2000 ||
-    typeof startsAt !== "string" || !Number.isFinite(Date.parse(startsAt)) || Date.parse(startsAt) <= Date.now() ||
+    (instant !== undefined && typeof instant !== "boolean") ||
+    (!isInstant && (typeof agenda !== "string" || agenda.trim().length < 3 || agenda.trim().length > 2000)) ||
+    (isInstant && agenda !== undefined && (typeof agenda !== "string" || agenda.trim().length > 2000)) ||
+    (!isInstant && (!Number.isFinite(scheduledStartTime) || scheduledStartTime <= Date.now())) ||
     (location !== undefined && (typeof location !== "string" || location.length > 160)) ||
-    (departmentId !== undefined && (typeof departmentId !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(departmentId))) ||
+    (departmentId !== undefined && (typeof departmentId !== "string" || (!isCompanyWide && !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(departmentId)))) ||
     (callMode !== undefined && callMode !== "voice" && callMode !== "video")
   ) {
-    response.status(400).json({ error: "Enter a meeting title, agenda, future start time, and a location under 160 characters." });
+    response.status(400).json({
+      error: isInstant
+        ? "Enter a meeting title and an optional agenda under 2,000 characters."
+        : "Enter a meeting title, agenda, future start time, and a location under 160 characters.",
+    });
     return;
   }
   try {
     const admin = createSupabaseAdminClient();
     const canScheduleAll = adminRoles.has(user.role);
+    if (isCompanyWide && !canScheduleAll) {
+      response.status(403).json({ error: "Only an administrator can start a meeting for all departments." });
+      return;
+    }
     const department = canScheduleAll
-      ? departmentId
+      ? isCompanyWide
+        ? null
+        : departmentId
         ? await admin.from("departments").select("id, name").eq("id", departmentId).maybeSingle().then(({ data, error }) => {
           if (error) throw error;
           return data;
         })
         : null
       : await getHeadDepartment(admin, user.id, user.departmentId);
-    if (canScheduleAll && !department) {
+    if (canScheduleAll && !department && !isCompanyWide) {
       response.status(400).json({ error: "Choose a department for this meeting." });
       return;
     }
-    if (!department) {
+    if (!department && !isCompanyWide) {
       response.status(403).json({ error: "Only the assigned head of department can schedule team meetings." });
       return;
     }
+    const departmentName = isCompanyWide ? "All departments" : department?.name ?? "Department";
+    const meetingStartsAt = isInstant ? new Date() : new Date(scheduledStartTime);
+    const meetingAgenda = typeof agenda === "string" && agenda.trim()
+      ? agenda.trim()
+      : "Instant department meeting";
     const { data, error } = await admin.from("department_meetings").insert({
-      department_id: department.id,
+      department_id: department?.id ?? null,
+      is_company_wide: isCompanyWide,
       created_by: user.id,
       title: title.trim(),
-      agenda: agenda.trim(),
-      starts_at: new Date(startsAt).toISOString(),
-      location: typeof location === "string" ? location.trim() || null : null,
+      agenda: meetingAgenda,
+      starts_at: meetingStartsAt.toISOString(),
+      is_instant: isInstant,
+      location: isInstant ? null : typeof location === "string" ? location.trim() || null : null,
       call_mode: callMode === "voice" ? "voice" : "video",
-    }).select("id, title, agenda, starts_at, location, call_mode, created_at").single();
+    }).select("id, title, agenda, starts_at, is_instant, location, call_mode, created_at").single();
     if (error) {
       sendDepartmentError(response, error, "Could not schedule department meeting.");
       return;
     }
     response.status(201).json({
-      meeting: { ...data, departmentId: department.id, departmentName: department.name, startsAt: data.starts_at, callMode: data.call_mode, createdByName: user.displayName ?? (canScheduleAll ? "Administrator" : "Department head") },
-      message: canScheduleAll
-        ? `Meeting scheduled for ${department.name}. All administrators can join this and every department meeting.`
-        : "Department meeting scheduled. All administrators can join this and every department meeting.",
+      meeting: {
+        id: data.id,
+        departmentId: department?.id ?? null,
+        departmentName,
+        title: data.title,
+        agenda: data.agenda,
+        startsAt: data.starts_at,
+        isInstant: data.is_instant,
+        location: data.location,
+        callMode: data.call_mode,
+        createdByName: user.displayName ?? (canScheduleAll ? "Administrator" : "Department head"),
+        createdAt: data.created_at,
+      },
+      message: isInstant
+        ? `Instant meeting started for ${departmentName}. Your team and administrators can join now.`
+        : canScheduleAll
+          ? `Meeting scheduled for ${departmentName}. All administrators can join this and every department meeting.`
+          : "Department meeting scheduled. All administrators can join this and every department meeting.",
     });
   } catch (error: unknown) {
     sendDepartmentError(response, error, "Could not initialize department meeting creation.");
@@ -530,7 +567,7 @@ router.get("/meetings/:meetingId/room", async (request, response) => {
   try {
     const admin = createSupabaseAdminClient();
     const { data: meeting, error } = await admin.from("department_meetings")
-      .select("id, department_id, title, starts_at, call_mode")
+      .select("id, department_id, is_company_wide, title, starts_at, call_mode")
       .eq("id", meetingId)
       .maybeSingle();
     if (error) {
@@ -541,7 +578,7 @@ router.get("/meetings/:meetingId/room", async (request, response) => {
       response.status(404).json({ error: "This meeting could not be found." });
       return;
     }
-    const canJoin = adminRoles.has(user.role) || user.departmentId === meeting.department_id;
+    const canJoin = adminRoles.has(user.role) || user.departmentId === meeting.department_id || meeting.is_company_wide;
     if (!canJoin) {
       response.status(403).json({ error: "This meeting is only available to its department and administrators." });
       return;
@@ -551,10 +588,12 @@ router.get("/meetings/:meetingId/room", async (request, response) => {
       response.status(409).json({ error: "The live room opens 15 minutes before the scheduled time and closes eight hours after it." });
       return;
     }
-    const { data: department, error: departmentError } = await admin.from("departments")
+    const { data: department, error: departmentError } = meeting.department_id
+      ? await admin.from("departments")
       .select("name")
       .eq("id", meeting.department_id)
-      .single();
+      .single()
+      : { data: null, error: null };
     if (departmentError) {
       sendDepartmentError(response, departmentError, "Could not load meeting department.");
       return;
@@ -574,7 +613,7 @@ router.get("/meetings/:meetingId/room", async (request, response) => {
       meeting: {
         id: meeting.id,
         title: meeting.title,
-        departmentName: department.name,
+        departmentName: meeting.is_company_wide ? "All departments" : department?.name ?? "Department",
         startsAt: meeting.starts_at,
         callMode: meeting.call_mode,
       },

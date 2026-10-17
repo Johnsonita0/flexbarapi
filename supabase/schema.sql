@@ -35,19 +35,55 @@ create table if not exists public.departments (
 alter table public.departments
   add column if not exists head_user_id uuid references public.profiles (id) on delete set null;
 
-create unique index if not exists departments_name_unique
-  on public.departments (lower(name));
+do $$
+begin
+  if exists (
+    select 1 from information_schema.columns
+    where table_schema = 'public' and table_name = 'departments' and column_name = 'company_id'
+  ) then
+    create unique index if not exists departments_company_name_unique
+      on public.departments (company_id, lower(name));
+  else
+    create unique index if not exists departments_name_unique
+      on public.departments (lower(name));
+  end if;
+end;
+$$;
 
-insert into public.departments (name)
-values
-  ('Management'),
-  ('Bar'),
-  ('Kitchen'),
-  ('Restaurant Floor'),
-  ('Cashier'),
-  ('Inventory & Store'),
-  ('Cleaning & Maintenance')
-on conflict do nothing;
+do $$
+begin
+  if exists (
+    select 1 from information_schema.columns
+    where table_schema = 'public'
+      and table_name = 'departments'
+      and column_name = 'company_id'
+  ) then
+    insert into public.departments (company_id, name)
+    select '00000000-0000-4000-8000-000000000001'::uuid, department.name
+    from (values
+      ('Management'),
+      ('Bar'),
+      ('Kitchen'),
+      ('Restaurant Floor'),
+      ('Cashier'),
+      ('Inventory & Store'),
+      ('Cleaning & Maintenance')
+    ) as department(name)
+    on conflict do nothing;
+  else
+    insert into public.departments (name)
+    values
+      ('Management'),
+      ('Bar'),
+      ('Kitchen'),
+      ('Restaurant Floor'),
+      ('Cashier'),
+      ('Inventory & Store'),
+      ('Cleaning & Maintenance')
+    on conflict do nothing;
+  end if;
+end;
+$$;
 
 alter table public.profiles
   add column if not exists department_id uuid references public.departments (id) on delete set null,
@@ -322,17 +358,83 @@ language plpgsql
 security definer
 set search_path = ''
 as $$
+declare
+  company_name text;
+  business_type text;
+  company_id uuid;
+  requested_company_id uuid;
+  owner_name text;
 begin
-  insert into public.profiles (id, display_name, role, is_active)
-  values (
-    new.id,
-    nullif(trim(coalesce(new.raw_user_meta_data ->> 'display_name', '')), ''),
-    case
-      when new.id = '9668b2c5-428f-4d38-a29f-b5de8aa3d6b0'::uuid then 'super_admin'::public.app_role
-      else 'staff'::public.app_role
-    end,
-    new.id = '9668b2c5-428f-4d38-a29f-b5de8aa3d6b0'::uuid
-  );
+  owner_name := nullif(trim(coalesce(new.raw_user_meta_data ->> 'display_name', '')), '');
+  company_name := nullif(trim(coalesce(new.raw_user_meta_data ->> 'company_name', '')), '');
+  business_type := coalesce(new.raw_user_meta_data ->> 'business_type', '');
+
+  if company_name is not null
+    and char_length(company_name) between 2 and 120
+    and business_type in ('pharmacy', 'bar', 'restaurant', 'bar_restaurant')
+    and to_regclass('public.companies') is not null
+    and exists (
+      select 1 from information_schema.columns
+      where table_schema = 'public' and table_name = 'profiles' and column_name = 'company_id'
+    ) then
+    execute 'insert into public.companies (name, business_type) values ($1, $2) returning id'
+      into company_id using company_name, business_type;
+    execute 'insert into public.profiles (id, display_name, role, is_active, company_id) values ($1, $2, $3, true, $4)'
+      using new.id, owner_name, 'management_admin'::public.app_role, company_id;
+    execute $insert_departments$
+      insert into public.departments (company_id, name, sales_enabled)
+      select $1, department.name, department.sales_enabled
+      from (values
+        ('Management', false, array['pharmacy', 'bar', 'restaurant', 'bar_restaurant']::text[]),
+        ('Pharmacy', true, array['pharmacy']::text[]),
+        ('Bar', true, array['bar', 'bar_restaurant']::text[]),
+        ('Kitchen', false, array['restaurant', 'bar_restaurant']::text[]),
+        ('Restaurant Floor', true, array['restaurant', 'bar_restaurant']::text[]),
+        ('Cashier', true, array['pharmacy', 'restaurant', 'bar_restaurant']::text[]),
+        ('Inventory & Store', false, array['pharmacy', 'bar', 'restaurant', 'bar_restaurant']::text[])
+      ) as department(name, sales_enabled, business_types)
+      where $2 = any(department.business_types)
+    $insert_departments$ using company_id, business_type;
+    execute 'insert into public.business_settings (company_id) values ($1)'
+      using company_id;
+    return new;
+  end if;
+
+  requested_company_id := null;
+  if coalesce(new.raw_user_meta_data ->> 'company_id', '') ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+    and to_regclass('public.companies') is not null then
+    execute 'select id from public.companies where id = $1::uuid'
+      into requested_company_id
+      using new.raw_user_meta_data ->> 'company_id';
+  end if;
+
+  if exists (
+    select 1 from information_schema.columns
+    where table_schema = 'public' and table_name = 'profiles' and column_name = 'company_id'
+  ) then
+    execute 'insert into public.profiles (id, display_name, role, is_active, company_id) values ($1, $2, $3, $4, coalesce($5, $6::uuid))'
+      using
+        new.id,
+        owner_name,
+        case
+          when new.id = '9668b2c5-428f-4d38-a29f-b5de8aa3d6b0'::uuid then 'super_admin'::public.app_role
+          else 'staff'::public.app_role
+        end,
+        new.id = '9668b2c5-428f-4d38-a29f-b5de8aa3d6b0'::uuid,
+        requested_company_id,
+        '00000000-0000-4000-8000-000000000001';
+  else
+    insert into public.profiles (id, display_name, role, is_active)
+    values (
+      new.id,
+      owner_name,
+      case
+        when new.id = '9668b2c5-428f-4d38-a29f-b5de8aa3d6b0'::uuid then 'super_admin'::public.app_role
+        else 'staff'::public.app_role
+      end,
+      new.id = '9668b2c5-428f-4d38-a29f-b5de8aa3d6b0'::uuid
+    );
+  end if;
   return new;
 end;
 $$;
@@ -853,7 +955,8 @@ begin
   from public.profiles
   where profiles.role in ('super_admin'::public.app_role, 'management_admin'::public.app_role)
     and profiles.is_active
-    and not profiles.is_archived;
+    and not profiles.is_archived
+    and profiles.company_id = new.company_id;
 
   return new;
 end;
@@ -883,16 +986,40 @@ $$;
 -- ============================================================
 -- 0005_demo_departments_and_products.sql
 -- ============================================================
-insert into public.departments (name)
-values
-  ('Bar'),
-  ('Kitchen'),
-  ('Restaurant Floor'),
-  ('Cashier'),
-  ('Inventory & Store'),
-  ('Cleaning & Maintenance'),
-  ('Management')
-on conflict do nothing;
+do $$
+begin
+  if exists (
+    select 1 from information_schema.columns
+    where table_schema = 'public'
+      and table_name = 'departments'
+      and column_name = 'company_id'
+  ) then
+    insert into public.departments (company_id, name)
+    select '00000000-0000-4000-8000-000000000001'::uuid, department.name
+    from (values
+      ('Bar'),
+      ('Kitchen'),
+      ('Restaurant Floor'),
+      ('Cashier'),
+      ('Inventory & Store'),
+      ('Cleaning & Maintenance'),
+      ('Management')
+    ) as department(name)
+    on conflict do nothing;
+  else
+    insert into public.departments (name)
+    values
+      ('Bar'),
+      ('Kitchen'),
+      ('Restaurant Floor'),
+      ('Cashier'),
+      ('Inventory & Store'),
+      ('Cleaning & Maintenance'),
+      ('Management')
+    on conflict do nothing;
+  end if;
+end;
+$$;
 
 delete from public.products
 where name in (
@@ -1040,11 +1167,13 @@ revoke all on public.shift_closings from anon, authenticated;
 
 create table if not exists public.department_meetings (
   id uuid primary key default gen_random_uuid(),
-  department_id uuid not null references public.departments (id) on delete cascade,
+  department_id uuid references public.departments (id) on delete cascade,
+  is_company_wide boolean not null default false,
   created_by uuid not null references public.profiles (id) on delete restrict,
   title text not null check (char_length(title) between 3 and 120),
   agenda text not null check (char_length(agenda) between 3 and 2000),
   starts_at timestamptz not null,
+  is_instant boolean not null default false,
   location text check (location is null or char_length(location) <= 160),
   call_mode text not null default 'video' check (call_mode in ('voice', 'video')),
   created_at timestamptz not null default now()
@@ -1053,6 +1182,13 @@ create table if not exists public.department_meetings (
 alter table public.department_meetings
   add column if not exists call_mode text not null default 'video'
   check (call_mode in ('voice', 'video'));
+
+alter table public.department_meetings
+  add column if not exists is_instant boolean not null default false;
+
+alter table public.department_meetings
+  add column if not exists is_company_wide boolean not null default false,
+  alter column department_id drop not null;
 
 create index if not exists department_meetings_department_starts_idx
   on public.department_meetings (department_id, starts_at);
@@ -1170,6 +1306,7 @@ begin
       and not profile.is_archived
       and (
         profile.role::text in ('super_admin', 'management_admin')
+        or (meeting.is_company_wide and profile.company_id = meeting.company_id)
         or profile.department_id = meeting.department_id
       )
   );
