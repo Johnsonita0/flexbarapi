@@ -6,6 +6,7 @@ import { createSupabaseAdminClient } from "../services/supabaseAdmin.js";
 const router = Router();
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const ringingLifetimeMs = 5 * 60_000;
+const maxCallParticipants = 8;
 
 function sendCallError(response: Response, error: unknown, context: string) {
   console.error(context, error);
@@ -223,6 +224,110 @@ router.post("/", async (request, response) => {
     response.status(201).json({ callId: room.id });
   } catch (error: unknown) {
     sendCallError(response, error, "Could not initialize call creation.");
+  }
+});
+
+router.post("/:callId/invitations", async (request, response) => {
+  const user = getUser(request, response);
+  if (!user) return;
+  const callId = request.params.callId;
+  const participantIds: unknown = request.body?.participantIds;
+  if (
+    !callId
+    || !uuidPattern.test(callId)
+    || !Array.isArray(participantIds)
+    || participantIds.length < 1
+    || participantIds.length > maxCallParticipants - 1
+    || participantIds.some((id) => typeof id !== "string" || !uuidPattern.test(id) || id === user.id)
+    || new Set(participantIds).size !== participantIds.length
+  ) {
+    response.status(400).json({ error: "Choose one or more colleagues to add to this call." });
+    return;
+  }
+  try {
+    const admin = createSupabaseAdminClient();
+    const [{ data: room, error: roomError }, { data: memberships, error: membershipsError }] = await Promise.all([
+      admin.from("call_rooms")
+        .select("id, status, company_id")
+        .eq("id", callId)
+        .eq("company_id", user.companyId)
+        .maybeSingle(),
+      admin.from("call_room_participants")
+        .select("user_id, status")
+        .eq("room_id", callId),
+    ]);
+    if (roomError || membershipsError) {
+      sendCallError(response, roomError ?? membershipsError, "Could not verify the call before inviting colleagues.");
+      return;
+    }
+    if (!room || !["ringing", "active"].includes(room.status)) {
+      response.status(410).json({ error: "This call has ended." });
+      return;
+    }
+    const callerMembership = memberships?.find((participant) => participant.user_id === user.id);
+    if (callerMembership?.status !== "joined") {
+      response.status(403).json({ error: "Only someone currently in the call can invite colleagues." });
+      return;
+    }
+    const activeMemberships = (memberships ?? []).filter((participant) =>
+      participant.status === "joined" || participant.status === "ringing");
+    const activeUserIds = new Set(activeMemberships.map((participant) => participant.user_id));
+    if (participantIds.some((id) => activeUserIds.has(id))) {
+      response.status(409).json({ error: "One or more selected colleagues are already in this call or have an invitation." });
+      return;
+    }
+    const previousUserIds = new Set((memberships ?? []).map((participant) => participant.user_id));
+    if (participantIds.some((id) => previousUserIds.has(id))) {
+      response.status(409).json({ error: "One or more selected colleagues have already participated in this call." });
+      return;
+    }
+    const availableSlots = maxCallParticipants - activeMemberships.length;
+    if (participantIds.length > availableSlots) {
+      response.status(400).json({ error: `This call has room for ${availableSlots} more ${availableSlots === 1 ? "person" : "people"}.` });
+      return;
+    }
+
+    const { data: profiles, error: profilesError } = await admin.from("profiles")
+      .select("id, display_name, role, avatar_path, is_active, is_archived")
+      .in("id", participantIds)
+      .eq("company_id", user.companyId);
+    if (profilesError) {
+      sendCallError(response, profilesError, "Could not verify the colleagues selected for this call.");
+      return;
+    }
+    if ((profiles ?? []).length !== participantIds.length || profiles?.some((profile) => !profile.is_active || profile.is_archived)) {
+      response.status(400).json({ error: "One or more selected colleagues are no longer active in your company." });
+      return;
+    }
+
+    const invitedAt = new Date().toISOString();
+    const { error: invitationError } = await admin.from("call_room_participants")
+      .insert(participantIds.map((userId: string) => ({
+        room_id: callId,
+        user_id: userId,
+        status: "ringing",
+        invited_at: invitedAt,
+      })));
+    if (invitationError) {
+      if ("code" in invitationError && invitationError.code === "23505") {
+        response.status(409).json({ error: "A selected colleague has already joined or been invited to this call." });
+        return;
+      }
+      sendCallError(response, invitationError, "Could not add the selected colleagues to the call.");
+      return;
+    }
+
+    response.status(201).json({
+      invited: (profiles ?? []).map((profile) => ({
+        id: profile.id,
+        name: profile.display_name ?? "Team member",
+        role: profile.role,
+        avatarPath: profile.avatar_path,
+        status: "ringing" as const,
+      })),
+    });
+  } catch (error: unknown) {
+    sendCallError(response, error, "Could not add colleagues to the call.");
   }
 });
 
