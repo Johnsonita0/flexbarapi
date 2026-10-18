@@ -140,6 +140,9 @@ $$;
 revoke all on function public.can_access_call_topic(text) from public, anon;
 grant execute on function public.can_access_call_topic(text) to authenticated;
 
+grant usage on schema realtime to authenticated;
+grant select, insert on table realtime.messages to authenticated;
+
 drop policy if exists in_app_call_signaling_read on realtime.messages;
 create policy in_app_call_signaling_read
   on realtime.messages
