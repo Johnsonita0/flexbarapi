@@ -498,28 +498,36 @@ router.patch("/:callId/:action", async (request, response) => {
       response.status(404).json({ error: "This call could not be found." });
       return;
     }
-    if (action === "end") {
-      if (room.created_by !== user.id) {
-        response.status(403).json({ error: "Only the call initiator can end the call for everyone." });
-        return;
-      }
-      const { error } = await admin.from("call_rooms")
-        .update({ status: "ended", ended_at: new Date().toISOString() })
-        .eq("id", callId);
-      if (error) {
-        sendCallError(response, error, "Could not end the call.");
-        return;
-      }
-      const { error: participantsError } = await admin.from("call_room_participants")
-        .update({ status: "left", left_at: new Date().toISOString() })
+    if (action === "end" || action === "leave") {
+      const { data: activeParticipants, error: activeParticipantsError } = await admin.from("call_room_participants")
+        .select("user_id")
         .eq("room_id", callId)
         .in("status", ["ringing", "joined"]);
-      if (participantsError) {
-        sendCallError(response, participantsError, "Could not notify participants that the call ended.");
+      if (activeParticipantsError) {
+        sendCallError(response, activeParticipantsError, "Could not check who is still in the call.");
         return;
       }
-      response.status(200).json({ ok: true });
-      return;
+      if ((activeParticipants ?? []).length <= 2) {
+        const endedAt = new Date().toISOString();
+        const { error } = await admin.from("call_rooms")
+          .update({ status: "ended", ended_at: endedAt })
+          .eq("id", callId)
+          .in("status", ["ringing", "active"]);
+        if (error) {
+          sendCallError(response, error, "Could not end the call.");
+          return;
+        }
+        const { error: participantsError } = await admin.from("call_room_participants")
+          .update({ status: "left", left_at: endedAt })
+          .eq("room_id", callId)
+          .in("status", ["ringing", "joined"]);
+        if (participantsError) {
+          sendCallError(response, participantsError, "Could not close the ended call's participants.");
+          return;
+        }
+        response.status(200).json({ ok: true });
+        return;
+      }
     }
     if (action === "join" && room.status === "ringing" && Date.now() - Date.parse(room.created_at) > ringingLifetimeMs) {
       response.status(410).json({ error: "This call invitation has expired." });
