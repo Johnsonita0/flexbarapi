@@ -5,6 +5,13 @@ import { createSupabaseAdminClient } from "../services/supabaseAdmin.js";
 
 const router = Router();
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const missedCallPattern = /^__flexbar_missed_call__:(audio|video):[0-9a-f-]{36}$/i;
+
+function messagePreview(body: string) {
+  const missedCall = missedCallPattern.exec(body);
+  if (!missedCall) return body;
+  return missedCall[1] === "video" ? "Missed video call" : "Missed voice call";
+}
 
 function sendChatError(response: Response, error: unknown, context: string) {
   console.error(context, error);
@@ -135,7 +142,7 @@ router.get("/conversations", async (request, response) => {
       return {
         id: conversation.id,
         peer: { id: peerLink?.user_id ?? "", name: peer?.display_name ?? "Team member", role: peer?.role ?? "staff", avatarPath: peer?.avatar_path ?? null },
-        lastMessage: latest?.body ?? "",
+        lastMessage: latest ? messagePreview(latest.body) : "",
         lastMessageAt: latest?.created_at ?? conversation.created_at,
         lastMessageFromMe: latest?.sender_id === user.id,
         lastMessageDeliveredAt: latest?.sender_id === user.id ? latest.delivered_at : null,

@@ -5,8 +5,9 @@ import { createSupabaseAdminClient } from "../services/supabaseAdmin.js";
 
 const router = Router();
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-const ringingLifetimeMs = 5 * 60_000;
+const ringingLifetimeMs = 60_000;
 const maxCallParticipants = 8;
+const missedCallPrefix = "__flexbar_missed_call__";
 
 function sendCallError(response: Response, error: unknown, context: string) {
   console.error(context, error);
@@ -42,6 +43,110 @@ function getIceServers() {
     iceServers,
     turnConfigured: turnUrls.length > 0 && Boolean(process.env.TURN_USERNAME && process.env.TURN_CREDENTIAL),
   };
+}
+
+async function recordMissedCall(
+  admin: ReturnType<typeof createSupabaseAdminClient>,
+  call: { id: string; created_by: string; media_mode: string },
+  recipientId: string,
+) {
+  const directKey = [call.created_by, recipientId].sort((left, right) => left.localeCompare(right)).join(":");
+  let { data: conversation, error: conversationError } = await admin.from("chat_conversations")
+    .select("id")
+    .eq("direct_key", directKey)
+    .maybeSingle();
+  if (conversationError) throw conversationError;
+  if (!conversation) {
+    const created = await admin.from("chat_conversations")
+      .insert({ direct_key: directKey, created_by: call.created_by })
+      .select("id")
+      .single();
+    if (created.error?.code === "23505") {
+      const existing = await admin.from("chat_conversations").select("id").eq("direct_key", directKey).single();
+      conversation = existing.data;
+      conversationError = existing.error;
+    } else {
+      conversation = created.data;
+      conversationError = created.error;
+    }
+  }
+  if (conversationError || !conversation) {
+    throw conversationError ?? new Error("Could not create the direct conversation for a missed call.");
+  }
+  const { error: participantsError } = await admin.from("chat_conversation_participants").upsert(
+    [
+      { conversation_id: conversation.id, user_id: call.created_by },
+      { conversation_id: conversation.id, user_id: recipientId },
+    ],
+    { onConflict: "conversation_id,user_id", ignoreDuplicates: true },
+  );
+  if (participantsError) throw participantsError;
+
+  const body = `${missedCallPrefix}:${call.media_mode}:${call.id}`;
+  const { data: existingMessage, error: messageLookupError } = await admin.from("chat_messages")
+    .select("id")
+    .eq("conversation_id", conversation.id)
+    .eq("body", body)
+    .maybeSingle();
+  if (messageLookupError) throw messageLookupError;
+  if (existingMessage) return;
+
+  const { data: caller, error: callerError } = await admin.from("profiles")
+    .select("display_name")
+    .eq("id", call.created_by)
+    .maybeSingle();
+  if (callerError) throw callerError;
+  const { error: messageError } = await admin.from("chat_messages").insert({
+    conversation_id: conversation.id,
+    sender_id: call.created_by,
+    sender_name: caller?.display_name ?? "Team member",
+    body,
+  });
+  if (messageError) throw messageError;
+}
+
+async function expireCallInvitation(
+  admin: ReturnType<typeof createSupabaseAdminClient>,
+  call: { id: string; created_by: string; company_id: string; media_mode: string; status: string },
+  recipientId: string,
+) {
+  if (call.status === "ringing") {
+    const { data: endedRoom, error: endError } = await admin.from("call_rooms")
+      .update({ status: "ended", ended_at: new Date().toISOString() })
+      .eq("id", call.id)
+      .eq("company_id", call.company_id)
+      .eq("status", "ringing")
+      .select("id")
+      .maybeSingle();
+    if (endError) throw endError;
+    if (!endedRoom) return;
+
+    const { data: invitees, error: inviteesError } = await admin.from("call_room_participants")
+      .select("user_id")
+      .eq("room_id", call.id)
+      .eq("status", "ringing")
+      .neq("user_id", call.created_by);
+    if (inviteesError) throw inviteesError;
+    const { error: membershipError } = await admin.from("call_room_participants")
+      .update({ status: "left", left_at: new Date().toISOString() })
+      .eq("room_id", call.id)
+      .in("status", ["ringing", "joined"]);
+    if (membershipError) throw membershipError;
+    for (const invitee of invitees ?? []) {
+      await recordMissedCall(admin, call, invitee.user_id);
+    }
+    return;
+  }
+
+  const { data: expiredInvitation, error: invitationError } = await admin.from("call_room_participants")
+    .update({ status: "left", left_at: new Date().toISOString() })
+    .eq("room_id", call.id)
+    .eq("user_id", recipientId)
+    .eq("status", "ringing")
+    .select("user_id")
+    .maybeSingle();
+  if (invitationError) throw invitationError;
+  if (expiredInvitation) await recordMissedCall(admin, call, recipientId);
 }
 
 router.use(requireUser);
@@ -167,6 +272,21 @@ router.post("/", async (request, response) => {
       return;
     }
 
+    const ringingCutoff = new Date(Date.now() - ringingLifetimeMs).toISOString();
+    const { data: expiredRooms, error: expiredRoomsError } = await admin.from("call_rooms")
+      .select("id, created_by, company_id, media_mode, status")
+      .eq("company_id", user.companyId)
+      .eq("created_by", user.id)
+      .eq("status", "ringing")
+      .lt("created_at", ringingCutoff);
+    if (expiredRoomsError) {
+      sendCallError(response, expiredRoomsError, "Could not check for expired calls before starting a new call.");
+      return;
+    }
+    for (const room of expiredRooms ?? []) {
+      await expireCallInvitation(admin, room, user.id);
+    }
+
     const leftAt = new Date().toISOString();
     const { data: previousRooms, error: previousRoomsError } = await admin.from("call_rooms")
       .update({ status: "ended", ended_at: leftAt })
@@ -189,7 +309,6 @@ router.post("/", async (request, response) => {
         return;
       }
     }
-    const ringingCutoff = new Date(Date.now() - ringingLifetimeMs).toISOString();
     const [activeCallResult, ringingCallResult] = await Promise.all([
       admin.from("call_rooms").select("id").eq("created_by", user.id).eq("status", "active").limit(1).maybeSingle(),
       admin.from("call_rooms").select("id").eq("created_by", user.id).eq("status", "ringing").gte("created_at", ringingCutoff).limit(1).maybeSingle(),
@@ -248,7 +367,7 @@ router.post("/:callId/invitations", async (request, response) => {
     const admin = createSupabaseAdminClient();
     const [{ data: room, error: roomError }, { data: memberships, error: membershipsError }] = await Promise.all([
       admin.from("call_rooms")
-        .select("id, status, company_id")
+        .select("id, created_by, company_id, media_mode, created_at, status")
         .eq("id", callId)
         .eq("company_id", user.companyId)
         .maybeSingle(),
@@ -262,6 +381,11 @@ router.post("/:callId/invitations", async (request, response) => {
     }
     if (!room || !["ringing", "active"].includes(room.status)) {
       response.status(410).json({ error: "This call has ended." });
+      return;
+    }
+    if (room.status === "ringing" && Date.now() - Date.parse(room.created_at) >= ringingLifetimeMs) {
+      await expireCallInvitation(admin, room, user.id);
+      response.status(410).json({ error: "This call invitation has expired." });
       return;
     }
     const callerMembership = memberships?.find((participant) => participant.user_id === user.id);
@@ -352,7 +476,7 @@ router.get("/invitations", async (request, response) => {
       return;
     }
     const { data: rooms, error: roomsError } = await admin.from("call_rooms")
-      .select("id, created_by, media_mode, created_at, status")
+      .select("id, created_by, company_id, media_mode, status")
       .in("id", roomIds)
       .eq("company_id", user.companyId)
       .in("status", ["ringing", "active"]);
@@ -360,24 +484,43 @@ router.get("/invitations", async (request, response) => {
       sendCallError(response, roomsError, "Could not load incoming call details.");
       return;
     }
-    const callerIds = [...new Set((rooms ?? []).map((room) => room.created_by))];
+    const roomById = new Map((rooms ?? []).map((room) => [room.id, room]));
+    for (const invitation of invitations ?? []) {
+      const room = roomById.get(invitation.room_id);
+      if (room && Date.now() - Date.parse(invitation.invited_at) >= ringingLifetimeMs) {
+        await expireCallInvitation(admin, room, user.id);
+      }
+    }
+    const currentInvitations = (invitations ?? []).filter((invitation) =>
+      Date.now() - Date.parse(invitation.invited_at) < ringingLifetimeMs);
+    const activeRoomIds = [...new Set(currentInvitations.map((invitation) => invitation.room_id))];
+    const activeRooms = (rooms ?? []).filter((room) => activeRoomIds.includes(room.id));
+    const callerIds = [...new Set(activeRooms.map((room) => room.created_by))];
     const { data: callers, error: callersError } = callerIds.length
-      ? await admin.from("profiles").select("id, display_name").in("id", callerIds)
+      ? await admin.from("profiles").select("id, display_name, role, avatar_path").in("id", callerIds)
       : { data: [], error: null };
     if (callersError) {
       sendCallError(response, callersError, "Could not load call initiator details.");
       return;
     }
-    const callerNames = new Map((callers ?? []).map((profile) => [profile.id, profile.display_name ?? "Team member"]));
+    const callerProfiles = new Map((callers ?? []).map((profile) => [profile.id, profile]));
     response.status(200).json({
-      invitations: (rooms ?? [])
-        .filter((room) => room.status === "active" || Date.now() - Date.parse(room.created_at) < ringingLifetimeMs)
-        .map((room) => ({
+      invitations: currentInvitations.flatMap((invitation) => {
+        const room = roomById.get(invitation.room_id);
+        const caller = room ? callerProfiles.get(room.created_by) : undefined;
+        if (!room || !caller) return [];
+        const role = caller.role === "super_admin" || caller.role === "management_admin"
+          ? "Admin"
+          : caller.role === "department_supervisor" ? "Manager" : "Staff";
+        return [{
           id: room.id,
-          callerName: callerNames.get(room.created_by) ?? "Team member",
+          callerName: caller.display_name ?? "Team member",
+          callerPosition: role,
+          callerAvatarPath: caller.avatar_path,
           mediaMode: room.media_mode,
-          createdAt: room.created_at,
-        })),
+          createdAt: invitation.invited_at,
+        }];
+      }),
     });
   } catch (error: unknown) {
     sendCallError(response, error, "Could not initialize incoming calls.");
@@ -416,7 +559,10 @@ router.get("/:callId", async (request, response) => {
       sendCallError(response, roomError, "Could not load the call.");
       return;
     }
-    if (!room || room.status === "ended" || (room.status === "ringing" && Date.now() - Date.parse(room.created_at) > ringingLifetimeMs)) {
+    if (!room || room.status === "ended" || (room.status === "ringing" && Date.now() - Date.parse(room.created_at) >= ringingLifetimeMs)) {
+      if (room?.status === "ringing" && Date.now() - Date.parse(room.created_at) >= ringingLifetimeMs) {
+        await expireCallInvitation(admin, room, user.id);
+      }
       response.status(410).json({ error: "This call has ended or its invitation expired." });
       return;
     }
@@ -473,7 +619,7 @@ router.patch("/:callId/:action", async (request, response) => {
   try {
     const admin = createSupabaseAdminClient();
     const { data: membership, error: membershipError } = await admin.from("call_room_participants")
-      .select("status")
+      .select("status, invited_at")
       .eq("room_id", callId)
       .eq("user_id", user.id)
       .maybeSingle();
@@ -486,7 +632,7 @@ router.patch("/:callId/:action", async (request, response) => {
       return;
     }
     const { data: room, error: roomError } = await admin.from("call_rooms")
-      .select("id, created_by, status, created_at")
+      .select("id, created_by, status, created_at, media_mode")
       .eq("id", callId)
       .eq("company_id", user.companyId)
       .maybeSingle();
@@ -529,7 +675,14 @@ router.patch("/:callId/:action", async (request, response) => {
         return;
       }
     }
-    if (action === "join" && room.status === "ringing" && Date.now() - Date.parse(room.created_at) > ringingLifetimeMs) {
+    if (action === "join" && membership.status === "ringing" && Date.now() - Date.parse(membership.invited_at) >= ringingLifetimeMs) {
+      await expireCallInvitation(admin, {
+        id: callId,
+        created_by: room.created_by,
+        company_id: user.companyId,
+        media_mode: room.media_mode,
+        status: room.status,
+      }, user.id);
       response.status(410).json({ error: "This call invitation has expired." });
       return;
     }
