@@ -43,19 +43,27 @@ router.post("/claim", async (request, response) => {
     const session = await authenticateSession(request, response);
     if (!session) return;
     const admin = createSupabaseAdminClient();
-    const { data: claimed, error } = await admin.rpc("claim_account_device_session", {
-      p_user_id: session.userId,
-      p_session_id: session.sessionId,
-    });
+    const replaceExisting = request.body?.replaceExisting === true;
+    const result = replaceExisting
+      ? await admin.from("account_device_sessions").upsert({
+        user_id: session.userId,
+        session_id: session.sessionId,
+        last_seen_at: new Date().toISOString(),
+      }, { onConflict: "user_id" })
+      : await admin.rpc("claim_account_device_session", {
+        p_user_id: session.userId,
+        p_session_id: session.sessionId,
+      });
+    const error = result.error;
     if (error) {
       console.error("Could not claim the account's active device session.", error);
       response.status(500).json({ error: "We couldn't verify whether another device is using this account." });
       return;
     }
-    if (claimed !== true) {
+    if (!replaceExisting && result.data !== true) {
       response.status(409).json({
         code: "ACCOUNT_ALREADY_ACTIVE",
-        error: "This account is already signed in on another device. Sign out there before trying again.",
+        error: "This account is already signed in on another device.",
       });
       return;
     }
