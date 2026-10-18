@@ -298,7 +298,7 @@ router.get("/:callId", async (request, response) => {
       sendCallError(response, membershipError, "Could not verify call access.");
       return;
     }
-    if (!membership || membership.status === "left") {
+    if (!membership) {
       response.status(403).json({ error: "You are not invited to this call." });
       return;
     }
@@ -313,6 +313,10 @@ router.get("/:callId", async (request, response) => {
     }
     if (!room || room.status === "ended" || (room.status === "ringing" && Date.now() - Date.parse(room.created_at) > ringingLifetimeMs)) {
       response.status(410).json({ error: "This call has ended or its invitation expired." });
+      return;
+    }
+    if (membership.status === "left") {
+      response.status(403).json({ error: "You are not invited to this call." });
       return;
     }
     const { data: memberships, error: membershipsError } = await admin.from("call_room_participants")
@@ -440,6 +444,35 @@ router.patch("/:callId/:action", async (request, response) => {
       if (error) {
         sendCallError(response, error, "Could not activate the call.");
         return;
+      }
+    } else if (action === "decline" && room.status === "ringing") {
+      const { data: remainingParticipants, error: invitationsError } = await admin.from("call_room_participants")
+        .select("user_id")
+        .eq("room_id", callId)
+        .in("status", ["ringing", "joined"])
+        .neq("user_id", room.created_by);
+      if (invitationsError) {
+        sendCallError(response, invitationsError, "Could not check remaining call invitations.");
+        return;
+      }
+      if (!remainingParticipants?.length) {
+        const endedAt = new Date().toISOString();
+        const { error: endError } = await admin.from("call_rooms")
+          .update({ status: "ended", ended_at: endedAt })
+          .eq("id", callId)
+          .eq("status", "ringing");
+        if (endError) {
+          sendCallError(response, endError, "Could not end the declined call.");
+          return;
+        }
+        const { error: participantsError } = await admin.from("call_room_participants")
+          .update({ status: "left", left_at: endedAt })
+          .eq("room_id", callId)
+          .in("status", ["ringing", "joined"]);
+        if (participantsError) {
+          sendCallError(response, participantsError, "Could not close participants in the declined call.");
+          return;
+        }
       }
     } else {
       const { data: activeMembers, error } = await admin.from("call_room_participants")

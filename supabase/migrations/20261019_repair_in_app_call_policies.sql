@@ -8,18 +8,18 @@ security definer
 set search_path = ''
 as $$
 declare
-  room_id uuid;
+  v_call_room_id uuid;
 begin
   if p_topic !~ '^call:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$' then
     return false;
   end if;
-  room_id := substring(p_topic from char_length('call:') + 1)::uuid;
+  v_call_room_id := substring(p_topic from char_length('call:') + 1)::uuid;
   return exists (
     select 1
     from public.call_rooms room
     join public.call_room_participants participant on participant.room_id = room.id
     join public.profiles profile on profile.id = participant.user_id
-    where room.id = room_id
+    where room.id = v_call_room_id
       and room.status in ('ringing', 'active')
       and (room.status = 'active' or room.created_at > now() - interval '5 minutes')
       and participant.user_id = (select auth.uid())
