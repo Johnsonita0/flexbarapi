@@ -2,6 +2,7 @@ import { Router } from "express";
 import type { Request, Response } from "express";
 import { requireUser } from "../auth/requireUser.js";
 import { createSupabaseAdminClient } from "../services/supabaseAdmin.js";
+import { sendIncomingCallPush } from "../services/callPush.js";
 
 const router = Router();
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -340,6 +341,11 @@ router.post("/", async (request, response) => {
       sendCallError(response, participantsError, "Could not invite call participants.");
       return;
     }
+    await sendIncomingCallPush(admin, user.companyId, participantIds as string[], {
+      callId: room.id,
+      callerName: user.displayName ?? "Team member",
+      mediaMode,
+    }).catch((error: unknown) => console.error("Could not queue call notifications.", error));
     response.status(201).json({ callId: room.id });
   } catch (error: unknown) {
     sendCallError(response, error, "Could not initialize call creation.");
@@ -440,6 +446,12 @@ router.post("/:callId/invitations", async (request, response) => {
       sendCallError(response, invitationError, "Could not add the selected colleagues to the call.");
       return;
     }
+
+    await sendIncomingCallPush(admin, user.companyId, participantIds as string[], {
+      callId,
+      callerName: user.displayName ?? "Team member",
+      mediaMode: room.media_mode === "video" ? "video" : "audio",
+    }).catch((error: unknown) => console.error("Could not queue call notifications.", error));
 
     response.status(201).json({
       invited: (profiles ?? []).map((profile) => ({

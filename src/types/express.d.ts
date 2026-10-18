@@ -5,6 +5,7 @@ declare global {
     interface Request {
       flexbarUser?: {
         id: string;
+        sessionId: string;
         companyId: string;
         email: string | null;
         displayName: string | null;

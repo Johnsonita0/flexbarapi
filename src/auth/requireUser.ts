@@ -121,6 +121,7 @@ export async function requireUser(
 
   request.flexbarUser = {
     id: user.id,
+    sessionId,
     companyId: profile.company_id,
     email: user.email ?? null,
     displayName:

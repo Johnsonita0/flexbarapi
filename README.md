@@ -13,6 +13,12 @@ Node.js, Express, and TypeScript API, designed for an independent Vercel deploym
 
 Cloudflare R2 is configured through server-only environment variables. The R2 client helper is ready for later file features; credentials are never sent to the frontend.
 
+## Incoming call push
+
+For an existing database, apply `supabase/migrations/20261021_call_push_subscriptions.sql` after `20261020_single_device_sessions.sql`. Generate a VAPID key pair from this folder with `npx web-push generate-vapid-keys`, then set `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, and `VAPID_SUBJECT` in the backend environment. Keep the private key backend-only. Add the same keys to local `.env` for local testing and to the backend Vercel project's environment before redeploying.
+
+To deliver every workspace notification while the app is closed, also set a random `PUSH_WEBHOOK_SECRET` in the backend environment, then create a Supabase Database Webhook for `public.notifications` on `INSERT`. Use `POST https://<backend-domain>/api/v1/push-notifications/webhook` and add `Authorization: Bearer <PUSH_WEBHOOK_SECRET>` as a request header. Keep that secret identical in Supabase and the backend deployment. The webhook handles all notification rows; users still need to enable browser notifications from Notifications on each device, and the PWA must have been installed/opened at least once there.
+
 ## Vercel
 
 Create a Vercel project connected to the backend Git repository and leave its Root Directory at the repository root (`./`). This is a separate repository, so there is no nested `backend` directory in the deployment. `vercel.json` builds the Express app as a Node function and routes requests to it. Verify `https://<your-api-domain>/api/v1/health` returns `200` after deployment. Configure `SUPABASE_URL`, either `SUPABASE_PUBLISHABLE_KEY` or `SUPABASE_ANON_KEY`, the server-only `SUPABASE_SERVICE_ROLE_KEY`, `FRONTEND_URL`, `FRONTEND_ORIGINS`, and the R2 variables in Vercel project settings. Set `FRONTEND_URL` to the deployed frontend origin and include that exact origin in `FRONTEND_ORIGINS`; add any production custom domain origins as well, comma-separated. Set the frontend project's `VITE_API_BASE_URL` to `https://<your-api-domain>` with no port or `/api/v1` suffix. Redeploy both projects after changing environment variables. The service-role secret must only be added to the backend deployment, never to frontend `VITE_*` variables. Do not add secret values to `.env.example`.
