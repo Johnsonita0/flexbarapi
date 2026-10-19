@@ -57,8 +57,8 @@ export async function requireUser(
   }
   if (activeSession !== true) {
     response.status(401).json({
-      code: "ACCOUNT_SESSION_REPLACED",
-      error: "This account is active on another device. Sign in again on this device if needed.",
+      code: "ACCOUNT_SESSION_NOT_REGISTERED",
+      error: "This device's sign-in session is no longer registered. Please sign in again.",
     });
     return;
   }

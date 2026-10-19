@@ -1,3 +1,4 @@
+import { createECDH } from "node:crypto";
 import * as webpush from "web-push";
 import type { createSupabaseAdminClient } from "./supabaseAdmin.js";
 
@@ -20,7 +21,6 @@ interface WorkspaceNotification {
 
 interface PushSubscription {
   user_id: string;
-  session_id: string;
   endpoint: string;
   p256dh: string;
   auth: string;
@@ -31,12 +31,43 @@ function getVapidKeys() {
   const privateKey = process.env.VAPID_PRIVATE_KEY;
   if (!publicKey && !privateKey) return null;
   if (!publicKey || !privateKey) throw new Error("Both VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY must be configured.");
+  if (
+    !/^[A-Za-z0-9_-]{87}$/.test(publicKey) ||
+    !/^[A-Za-z0-9_-]{43}$/.test(privateKey)
+  ) {
+    throw new Error("The configured VAPID keys have an invalid format.");
+  }
+  const publicBytes = Buffer.from(publicKey, "base64url");
+  const privateBytes = Buffer.from(privateKey, "base64url");
+  if (
+    publicBytes.length !== 65 ||
+    publicBytes[0] !== 4 ||
+    publicBytes.toString("base64url") !== publicKey ||
+    privateBytes.length !== 32 ||
+    privateBytes.toString("base64url") !== privateKey
+  ) {
+    throw new Error("The configured VAPID keys have an invalid encoding.");
+  }
+  const ecdh = createECDH("prime256v1");
+  ecdh.setPrivateKey(privateBytes);
+  if (!ecdh.getPublicKey(undefined, "uncompressed").equals(publicBytes)) {
+    throw new Error("The configured VAPID public and private keys do not match.");
+  }
   return { publicKey, privateKey };
 }
 
 export function getCallPushConfig() {
-  const keys = getVapidKeys();
-  return { enabled: Boolean(keys), publicKey: keys?.publicKey ?? null };
+  try {
+    const keys = getVapidKeys();
+    return { enabled: Boolean(keys), publicKey: keys?.publicKey ?? null, configurationError: null };
+  } catch (error: unknown) {
+    console.error("Call notification VAPID configuration is invalid.", error);
+    return {
+      enabled: false,
+      publicKey: null,
+      configurationError: "Call alerts are misconfigured. Please contact your administrator.",
+    };
+  }
 }
 
 function configureVapid() {
@@ -71,19 +102,6 @@ async function sendToSubscriptions(
   payload: Record<string, string>,
 ) {
   await Promise.all(subscriptions.map(async (subscription) => {
-    const { data: isActiveSession, error: sessionError } = await admin.rpc("is_active_account_device_session", {
-      p_user_id: subscription.user_id,
-      p_session_id: subscription.session_id,
-    });
-    if (sessionError) {
-      console.error("Could not verify the device session for a push subscription.", sessionError);
-      return;
-    }
-    if (isActiveSession !== true) {
-      await removeSubscription(admin, subscription.user_id, subscription.endpoint);
-      return;
-    }
-
     try {
       await webpush.sendNotification(
         {
@@ -119,7 +137,7 @@ export async function sendIncomingCallPush(
   }
 
   const { data: subscriptions, error } = await admin.from("call_push_subscriptions")
-    .select("user_id, session_id, endpoint, p256dh, auth")
+    .select("user_id, endpoint, p256dh, auth")
     .eq("company_id", companyId)
     .in("user_id", participantIds);
   if (error) {
@@ -140,7 +158,7 @@ export async function sendIncomingCallPush(
 export async function sendWorkspaceNotificationPush(admin: AdminClient, notification: WorkspaceNotification) {
   if (!configureVapid()) return;
   const { data: subscriptions, error } = await admin.from("call_push_subscriptions")
-    .select("user_id, session_id, endpoint, p256dh, auth")
+    .select("user_id, endpoint, p256dh, auth")
     .eq("company_id", notification.companyId)
     .eq("user_id", notification.userId);
   if (error) {
