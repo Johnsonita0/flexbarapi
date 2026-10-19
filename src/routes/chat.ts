@@ -11,7 +11,7 @@ const endedCallPattern = /^__flexbar_call_ended__:(audio|video):[0-9a-f-]{36}:(\
 const voiceMessagePattern = /^__flexbar_voice_message__:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\/[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\/[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.(webm|ogg|m4a)$/i;
 
 function messagePreview(body: string) {
-  if (voiceMessagePattern.test(body)) return "Voice message";
+  if (voiceMessagePattern.test(body) || body.startsWith("__flexbar_voice_message__:")) return "Voice message";
   const missedCall = missedCallPattern.exec(body);
   if (missedCall) return missedCall[1] === "video" ? "Missed video call" : "Missed voice call";
   const declinedCall = declinedCallPattern.exec(body);
