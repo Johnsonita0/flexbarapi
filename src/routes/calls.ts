@@ -28,7 +28,81 @@ function getUser(request: Request, response: Response) {
   return user;
 }
 
-function getIceServers() {
+interface CallIceServer {
+  urls: string | string[];
+  username?: string;
+  credential?: string;
+}
+
+function getMeteredAppName() {
+  const appName = process.env.METERED_APP_NAME?.trim();
+  if (!appName) return null;
+  if (!/^[a-z0-9-]+$/i.test(appName)) {
+    throw new Error("METERED_APP_NAME must be the app name from the Metered dashboard, without a URL.");
+  }
+  return appName;
+}
+
+function getMeteredIceServers(value: unknown): CallIceServer[] {
+  const payload = Array.isArray(value)
+    ? value
+    : typeof value === "object" && value !== null && "iceServers" in value
+      ? value.iceServers
+      : null;
+  if (!Array.isArray(payload)) {
+    throw new Error("Metered returned an invalid TURN server response.");
+  }
+
+  const iceServers: CallIceServer[] = [];
+  for (const server of payload) {
+    if (typeof server !== "object" || server === null || !("urls" in server)) continue;
+    const rawUrls: unknown = server.urls;
+    const urlCandidates: unknown[] = typeof rawUrls === "string" ? [rawUrls] : Array.isArray(rawUrls) ? rawUrls : [];
+    const urls = urlCandidates
+      .filter((url): url is string => typeof url === "string" && /^(turns?|stun):/i.test(url));
+    if (!urls.length) continue;
+    const hasRelayUrl = urls.some((url) => /^turns?:/i.test(url));
+    const username = "username" in server && typeof server.username === "string" ? server.username : undefined;
+    const credential = "credential" in server && typeof server.credential === "string" ? server.credential : undefined;
+    if (hasRelayUrl && (!username || !credential)) {
+      throw new Error("Metered returned a TURN server without valid credentials.");
+    }
+    iceServers.push({
+      urls: urls.length === 1 ? urls[0]! : urls,
+      ...(username ? { username } : {}),
+      ...(credential ? { credential } : {}),
+    });
+  }
+  if (!iceServers.some((server) => (Array.isArray(server.urls) ? server.urls : [server.urls]).some((url) => /^turns?:/i.test(url)))) {
+    throw new Error("Metered did not return a usable TURN relay.");
+  }
+  return iceServers;
+}
+
+async function getIceServers() {
+  const meteredAppName = getMeteredAppName();
+  const meteredApiKey = process.env.METERED_API_KEY?.trim();
+  if (meteredAppName || meteredApiKey) {
+    if (!meteredAppName || !meteredApiKey) {
+      throw new Error("Both METERED_APP_NAME and METERED_API_KEY must be configured.");
+    }
+    const endpoint = new URL(`https://${meteredAppName}.metered.live/api/v1/turn/credentials`);
+    endpoint.searchParams.set("apiKey", meteredApiKey);
+    const response = await fetch(endpoint, {
+      headers: { Accept: "application/json" },
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!response.ok) {
+      console.error("Metered TURN credentials request failed.", { status: response.status });
+      throw new Error("Metered TURN credentials could not be loaded.");
+    }
+    const meteredServers = getMeteredIceServers(await response.json());
+    return {
+      iceServers: [{ urls: "stun:stun.l.google.com:19302" }, ...meteredServers],
+      turnConfigured: true,
+    };
+  }
+
   const iceServers: { urls: string | string[]; username?: string; credential?: string }[] = [
     { urls: "stun:stun.l.google.com:19302" },
   ];
@@ -676,7 +750,7 @@ router.get("/:callId", async (request, response) => {
           status: item.status,
         }] : [];
       }),
-      ...getIceServers(),
+      ...await getIceServers(),
     });
   } catch (error: unknown) {
     sendCallError(response, error, "Could not initialize the call room.");
