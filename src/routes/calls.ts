@@ -33,16 +33,20 @@ function getIceServers() {
     { urls: "stun:stun.l.google.com:19302" },
   ];
   const turnUrls = process.env.TURN_URLS?.split(",").map((url) => url.trim()).filter(Boolean) ?? [];
-  if (turnUrls.length && process.env.TURN_USERNAME && process.env.TURN_CREDENTIAL) {
+  const relayUrls = turnUrls.filter((url) => /^turns?:/i.test(url));
+  const username = process.env.TURN_USERNAME;
+  const credential = process.env.TURN_CREDENTIAL;
+  const turnConfigured = relayUrls.length > 0 && Boolean(username && credential);
+  if (relayUrls.length && username && credential) {
     iceServers.push({
-      urls: turnUrls,
-      username: process.env.TURN_USERNAME,
-      credential: process.env.TURN_CREDENTIAL,
+      urls: relayUrls,
+      username,
+      credential,
     });
   }
   return {
     iceServers,
-    turnConfigured: turnUrls.length > 0 && Boolean(process.env.TURN_USERNAME && process.env.TURN_CREDENTIAL),
+    turnConfigured,
   };
 }
 
