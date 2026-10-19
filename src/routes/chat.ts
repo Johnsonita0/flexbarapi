@@ -6,11 +6,23 @@ import { createSupabaseAdminClient } from "../services/supabaseAdmin.js";
 const router = Router();
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const missedCallPattern = /^__flexbar_missed_call__:(audio|video):[0-9a-f-]{36}$/i;
+const declinedCallPattern = /^__flexbar_call_declined__:(audio|video):[0-9a-f-]{36}$/i;
+const endedCallPattern = /^__flexbar_call_ended__:(audio|video):[0-9a-f-]{36}:(\d+)$/i;
 
 function messagePreview(body: string) {
   const missedCall = missedCallPattern.exec(body);
-  if (!missedCall) return body;
-  return missedCall[1] === "video" ? "Missed video call" : "Missed voice call";
+  if (missedCall) return missedCall[1] === "video" ? "Missed video call" : "Missed voice call";
+  const declinedCall = declinedCallPattern.exec(body);
+  if (declinedCall) return declinedCall[1] === "video" ? "Declined video call" : "Declined voice call";
+  const endedCall = endedCallPattern.exec(body);
+  if (endedCall) {
+    const durationSeconds = Number(endedCall[2]);
+    const minutes = Math.floor(durationSeconds / 60);
+    const seconds = durationSeconds % 60;
+    const duration = minutes ? `${minutes} min${seconds ? ` ${seconds} sec` : ""}` : `${seconds} sec`;
+    return `${endedCall[1] === "video" ? "Video" : "Voice"} call · ${duration}`;
+  }
+  return body;
 }
 
 function sendChatError(response: Response, error: unknown, context: string) {

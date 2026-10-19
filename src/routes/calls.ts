@@ -46,10 +46,11 @@ function getIceServers() {
   };
 }
 
-async function recordMissedCall(
+async function recordCallHistory(
   admin: ReturnType<typeof createSupabaseAdminClient>,
   call: { id: string; created_by: string; media_mode: string },
   recipientId: string,
+  event: { type: "missed" } | { type: "declined" } | { type: "ended"; durationSeconds: number },
 ) {
   const directKey = [call.created_by, recipientId].sort((left, right) => left.localeCompare(right)).join(":");
   let { data: conversation, error: conversationError } = await admin.from("chat_conversations")
@@ -83,7 +84,11 @@ async function recordMissedCall(
   );
   if (participantsError) throw participantsError;
 
-  const body = `${missedCallPrefix}:${call.media_mode}:${call.id}`;
+  const body = event.type === "missed"
+    ? `${missedCallPrefix}:${call.media_mode}:${call.id}`
+    : event.type === "declined"
+      ? `__flexbar_call_declined__:${call.media_mode}:${call.id}`
+      : `__flexbar_call_ended__:${call.media_mode}:${call.id}:${event.durationSeconds}`;
   const { data: existingMessage, error: messageLookupError } = await admin.from("chat_messages")
     .select("id")
     .eq("conversation_id", conversation.id)
@@ -92,18 +97,42 @@ async function recordMissedCall(
   if (messageLookupError) throw messageLookupError;
   if (existingMessage) return;
 
-  const { data: caller, error: callerError } = await admin.from("profiles")
+  const senderId = event.type === "declined" ? recipientId : call.created_by;
+  const { data: sender, error: senderError } = await admin.from("profiles")
     .select("display_name")
-    .eq("id", call.created_by)
+    .eq("id", senderId)
     .maybeSingle();
-  if (callerError) throw callerError;
+  if (senderError) throw senderError;
   const { error: messageError } = await admin.from("chat_messages").insert({
     conversation_id: conversation.id,
-    sender_id: call.created_by,
-    sender_name: caller?.display_name ?? "Team member",
+    sender_id: senderId,
+    sender_name: sender?.display_name ?? "Team member",
     body,
   });
   if (messageError) throw messageError;
+}
+
+async function recordEndedCallHistory(
+  admin: ReturnType<typeof createSupabaseAdminClient>,
+  call: { id: string; created_by: string; media_mode: string },
+  endedAt: string,
+) {
+  const { data: participants, error } = await admin.from("call_room_participants")
+    .select("user_id, joined_at, left_at")
+    .eq("room_id", call.id)
+    .not("joined_at", "is", null)
+    .neq("user_id", call.created_by);
+  if (error) throw error;
+
+  for (const participant of participants ?? []) {
+    if (!participant.joined_at) continue;
+    const participantEndedAt = participant.left_at ?? endedAt;
+    const durationSeconds = Math.max(
+      0,
+      Math.floor((Date.parse(participantEndedAt) - Date.parse(participant.joined_at)) / 1000),
+    );
+    await recordCallHistory(admin, call, participant.user_id, { type: "ended", durationSeconds });
+  }
 }
 
 async function expireCallInvitation(
@@ -134,7 +163,7 @@ async function expireCallInvitation(
       .in("status", ["ringing", "joined"]);
     if (membershipError) throw membershipError;
     for (const invitee of invitees ?? []) {
-      await recordMissedCall(admin, call, invitee.user_id);
+      await recordCallHistory(admin, call, invitee.user_id, { type: "missed" });
     }
     return;
   }
@@ -147,7 +176,7 @@ async function expireCallInvitation(
     .select("user_id")
     .maybeSingle();
   if (invitationError) throw invitationError;
-  if (expiredInvitation) await recordMissedCall(admin, call, recipientId);
+  if (expiredInvitation) await recordCallHistory(admin, call, recipientId, { type: "missed" });
 }
 
 router.use(requireUser);
@@ -163,7 +192,7 @@ router.post("/signout", async (request, response) => {
       .eq("company_id", user.companyId)
       .eq("created_by", user.id)
       .in("status", ["active", "ringing"])
-      .select("id");
+      .select("id, created_by, media_mode");
     if (ownedRoomsError) {
       sendCallError(response, ownedRoomsError, "Could not end calls started by the signing-out user.");
       return;
@@ -177,6 +206,13 @@ router.post("/signout", async (request, response) => {
       if (error) {
         sendCallError(response, error, "Could not close call memberships for calls started by the signing-out user.");
         return;
+      }
+      for (const room of ownedRooms ?? []) {
+        try {
+          await recordEndedCallHistory(admin, room, leftAt);
+        } catch (historyError: unknown) {
+          console.error("Could not record a call ended during sign-out in chat history.", historyError);
+        }
       }
     }
 
@@ -193,7 +229,7 @@ router.post("/signout", async (request, response) => {
       .filter((roomId) => !ownedRoomIds.includes(roomId)))];
     if (candidateRoomIds.length) {
       const { data: otherRooms, error: otherRoomsError } = await admin.from("call_rooms")
-        .select("id")
+        .select("id, created_by, media_mode")
         .eq("company_id", user.companyId)
         .in("id", candidateRoomIds)
         .in("status", ["active", "ringing"]);
@@ -223,14 +259,23 @@ router.post("/signout", async (request, response) => {
             return;
           }
           if (!remainingMembers?.length) {
+            const endedAt = new Date().toISOString();
             const { error } = await admin.from("call_rooms")
-              .update({ status: "ended", ended_at: leftAt })
+              .update({ status: "ended", ended_at: endedAt })
               .eq("id", roomId)
               .eq("company_id", user.companyId)
               .in("status", ["active", "ringing"]);
             if (error) {
               sendCallError(response, error, "Could not end an empty call room.");
               return;
+            }
+            const endedRoom = otherRooms?.find((room) => room.id === roomId);
+            if (endedRoom) {
+              try {
+                await recordEndedCallHistory(admin, endedRoom, endedAt);
+              } catch (historyError: unknown) {
+                console.error("Could not record a call ended during sign-out in chat history.", historyError);
+              }
             }
           }
         }
@@ -294,7 +339,7 @@ router.post("/", async (request, response) => {
       .eq("company_id", user.companyId)
       .eq("created_by", user.id)
       .in("status", ["active", "ringing"])
-      .select("id");
+      .select("id, created_by, media_mode");
     if (previousRoomsError) {
       sendCallError(response, previousRoomsError, "Could not close a previous call before starting a new call.");
       return;
@@ -308,6 +353,13 @@ router.post("/", async (request, response) => {
       if (error) {
         sendCallError(response, error, "Could not close participants in a previous call.");
         return;
+      }
+      for (const previousRoom of previousRooms ?? []) {
+        try {
+          await recordEndedCallHistory(admin, previousRoom, leftAt);
+        } catch (historyError: unknown) {
+          console.error("Could not record a previous call in chat history.", historyError);
+        }
       }
     }
     const [activeCallResult, ringingCallResult] = await Promise.all([
@@ -331,8 +383,9 @@ router.post("/", async (request, response) => {
       sendCallError(response, roomError, "Could not create a call room.");
       return;
     }
+    const callerJoinedAt = new Date().toISOString();
     const { error: participantsError } = await admin.from("call_room_participants").insert([
-      { room_id: room.id, user_id: user.id, status: "joined", joined_at: new Date().toISOString() },
+      { room_id: room.id, user_id: user.id, status: "joined", joined_at: callerJoinedAt },
       ...participantIds.map((userId: string) => ({ room_id: room.id, user_id: userId, status: "ringing" })),
     ]);
     if (participantsError) {
@@ -509,25 +562,31 @@ router.get("/invitations", async (request, response) => {
     const activeRooms = (rooms ?? []).filter((room) => activeRoomIds.includes(room.id));
     const callerIds = [...new Set(activeRooms.map((room) => room.created_by))];
     const { data: callers, error: callersError } = callerIds.length
-      ? await admin.from("profiles").select("id, display_name, role, avatar_path").in("id", callerIds)
+      ? await admin.from("profiles").select("id, display_name, role, avatar_path, department_id").in("id", callerIds)
       : { data: [], error: null };
     if (callersError) {
       sendCallError(response, callersError, "Could not load call initiator details.");
       return;
     }
+    const departmentIds = [...new Set((callers ?? []).flatMap((caller) => caller.department_id ? [caller.department_id] : []))];
+    const { data: departments, error: departmentsError } = departmentIds.length
+      ? await admin.from("departments").select("id, name").in("id", departmentIds)
+      : { data: [], error: null };
+    if (departmentsError) {
+      sendCallError(response, departmentsError, "Could not load caller department details.");
+      return;
+    }
+    const departmentNames = new Map((departments ?? []).map((department) => [department.id, department.name]));
     const callerProfiles = new Map((callers ?? []).map((profile) => [profile.id, profile]));
     response.status(200).json({
       invitations: currentInvitations.flatMap((invitation) => {
         const room = roomById.get(invitation.room_id);
         const caller = room ? callerProfiles.get(room.created_by) : undefined;
         if (!room || !caller) return [];
-        const role = caller.role === "super_admin" || caller.role === "management_admin"
-          ? "Admin"
-          : caller.role === "department_supervisor" ? "Manager" : "Staff";
         return [{
           id: room.id,
-          callerName: caller.display_name ?? "Team member",
-          callerPosition: role,
+          callerName: caller.display_name?.trim() || "Caller",
+          callerDepartment: caller.department_id ? departmentNames.get(caller.department_id) ?? "Department" : "Unassigned department",
           callerAvatarPath: caller.avatar_path,
           mediaMode: room.media_mode,
           createdAt: invitation.invited_at,
@@ -683,6 +742,11 @@ router.patch("/:callId/:action", async (request, response) => {
           sendCallError(response, participantsError, "Could not close the ended call's participants.");
           return;
         }
+        try {
+          await recordEndedCallHistory(admin, room, endedAt);
+        } catch (historyError: unknown) {
+          console.error("Could not record the ended call in chat history.", historyError);
+        }
         response.status(200).json({ ok: true });
         return;
       }
@@ -716,6 +780,13 @@ router.patch("/:callId/:action", async (request, response) => {
     if (!updated) {
       response.status(403).json({ error: "You are not invited to this call." });
       return;
+    }
+    if (action === "decline") {
+      try {
+        await recordCallHistory(admin, room, user.id, { type: "declined" });
+      } catch (historyError: unknown) {
+        console.error("Could not record the declined call in chat history.", historyError);
+      }
     }
     if (action === "join") {
       const { error } = await admin.from("call_rooms").update({ status: "active" }).eq("id", callId).eq("status", "ringing");
@@ -763,12 +834,18 @@ router.patch("/:callId/:action", async (request, response) => {
         return;
       }
       if (!activeMembers?.length) {
+        const endedAt = new Date().toISOString();
         const { error: endError } = await admin.from("call_rooms")
-          .update({ status: "ended", ended_at: new Date().toISOString() })
+          .update({ status: "ended", ended_at: endedAt })
           .eq("id", callId);
         if (endError) {
           sendCallError(response, endError, "Could not close the call after its final participant left.");
           return;
+        }
+        try {
+          await recordEndedCallHistory(admin, room, endedAt);
+        } catch (historyError: unknown) {
+          console.error("Could not record the ended call in chat history.", historyError);
         }
       }
     }
