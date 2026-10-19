@@ -35,6 +35,14 @@ app.use(
 );
 app.use(express.json({ limit: "1mb" }));
 
+app.get("/", (_request, response) => {
+  response.status(200).json({
+    status: "ok",
+    service: "flexbar-api",
+    health: "/api/v1/health",
+  });
+});
+
 app.get("/api/v1/health", (_request, response) => {
   response.status(200).json({ status: "ok", service: "flexbar-api" });
 });
