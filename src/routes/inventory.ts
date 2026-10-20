@@ -2,6 +2,7 @@ import { Router } from "express";
 import type { Request, Response } from "express";
 import { requireUser } from "../auth/requireUser.js";
 import { createSupabaseAdminClient } from "../services/supabaseAdmin.js";
+import { notifyAdminsOfSystemError } from "../services/systemNotifications.js";
 
 const router = Router();
 const allowedRoles = new Set(["super_admin", "management_admin", "inventory_officer"]);
@@ -16,8 +17,9 @@ function requireInventoryRole(request: Request, response: Response): boolean {
   return true;
 }
 
-function sendInventoryError(response: Response, error: unknown, context: string) {
+async function sendInventoryError(response: Response, error: unknown, context: string) {
   console.error(context, error);
+  await notifyAdminsOfSystemError(response, error, context);
   if (error instanceof Error && error.message.includes("Missing required environment variable: SUPABASE_SERVICE_ROLE_KEY")) {
     response.status(503).json({ error: "Inventory services are not configured yet. Please contact the system administrator." });
     return;

@@ -2,6 +2,7 @@ import { createClient } from "@supabase/supabase-js";
 import type { NextFunction, Request, Response } from "express";
 import { getRequiredEnv } from "../config/env.js";
 import { runWithCompany } from "../services/companyContext.js";
+import { notifyAdminsOfSystemError } from "../services/systemNotifications.js";
 import { getSessionIdFromToken } from "./sessionId.js";
 import { isAppRole } from "./roles.js";
 
@@ -92,6 +93,7 @@ export async function requireUser(
     response.status(403).json({ error: "Your account is not assigned to a company workspace. Please contact your administrator." });
     return;
   }
+  response.locals.flexbarCompanyId = profile.company_id;
 
   let salesEnabled = false;
   if (typeof profile.department_id === "string") {
@@ -103,6 +105,7 @@ export async function requireUser(
       .maybeSingle();
     if (departmentError) {
       console.error("Could not load the authenticated user's department access.", departmentError);
+      await notifyAdminsOfSystemError(response, departmentError, "Could not load the authenticated user's department access.");
       response.status(500).json({ error: "We couldn't load your department access. Please try again or contact your administrator." });
       return;
     }
@@ -115,6 +118,7 @@ export async function requireUser(
     .single();
   if (companyError) {
     console.error("Could not load the authenticated user's company workspace.", companyError);
+    await notifyAdminsOfSystemError(response, companyError, "Could not load the authenticated user's company workspace.");
     response.status(500).json({ error: "We couldn't load your company workspace. Please try again or contact your administrator." });
     return;
   }

@@ -3,6 +3,7 @@ import type { Request, Response } from "express";
 import { requireUser } from "../auth/requireUser.js";
 import { createSupabaseAdminClient } from "../services/supabaseAdmin.js";
 import { sendIncomingCallPush } from "../services/callPush.js";
+import { notifyAdminsOfSystemError } from "../services/systemNotifications.js";
 
 const router = Router();
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -10,8 +11,9 @@ const ringingLifetimeMs = 60_000;
 const maxCallParticipants = 8;
 const missedCallPrefix = "__flexbar_missed_call__";
 
-function sendCallError(response: Response, error: unknown, context: string) {
+async function sendCallError(response: Response, error: unknown, context: string) {
   console.error(context, error);
+  await notifyAdminsOfSystemError(response, error, context);
   if (error instanceof Error && error.message.includes("Missing required environment variable")) {
     response.status(503).json({ error: "Calls are not configured yet. Please contact your administrator." });
     return;

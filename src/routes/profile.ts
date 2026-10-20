@@ -2,12 +2,14 @@ import { Router } from "express";
 import type { Response } from "express";
 import { requireUser } from "../auth/requireUser.js";
 import { createSupabaseAdminClient } from "../services/supabaseAdmin.js";
+import { notifyAdminsOfSystemError } from "../services/systemNotifications.js";
 
 const router = Router();
 const avatarPathPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\/[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.jpg$/i;
 
-function sendProfileError(response: Response, error: unknown) {
+async function sendProfileError(response: Response, error: unknown) {
   console.error("Could not update the signed-in user's profile.", error);
+  await notifyAdminsOfSystemError(response, error, "Could not update the signed-in user's profile.");
   if (error instanceof Error && error.message.includes("Missing required environment variable: SUPABASE_SERVICE_ROLE_KEY")) {
     response.status(503).json({ error: "Profile services are not configured yet. Please contact the system administrator." });
     return;

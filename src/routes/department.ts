@@ -1,12 +1,14 @@
 import { Router } from "express";
 import { requireUser } from "../auth/requireUser.js";
 import { createSupabaseAdminClient } from "../services/supabaseAdmin.js";
+import { notifyAdminsOfSystemError } from "../services/systemNotifications.js";
 
 const router = Router();
 const adminRoles = new Set(["super_admin", "management_admin"]);
 
-function sendDepartmentError(response: import("express").Response, error: unknown, context: string) {
+async function sendDepartmentError(response: import("express").Response, error: unknown, context: string) {
   console.error(context, error);
+  await notifyAdminsOfSystemError(response, error, context);
   response.status(500).json({ error: "We couldn't complete that department request. Please try again." });
 }
 

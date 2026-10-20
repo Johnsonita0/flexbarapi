@@ -4,6 +4,7 @@ import type { Request, Response } from "express";
 import { requireUser } from "../auth/requireUser.js";
 import { AdminActivityWriteError, recordAdminActivity } from "../services/adminActivity.js";
 import { createSupabaseAdminClient } from "../services/supabaseAdmin.js";
+import { notifyAdminsOfSystemError } from "../services/systemNotifications.js";
 
 const router = Router();
 const adminRoles = new Set(["super_admin", "management_admin"]);
@@ -20,8 +21,9 @@ interface AttendanceLocation extends Coordinates {
 const attendanceQrPeriodSeconds = 30;
 const attendanceRadiusMeters = 10;
 
-function sendAttendanceError(response: Response, error: unknown, context: string) {
+async function sendAttendanceError(response: Response, error: unknown, context: string) {
   console.error(context, error);
+  await notifyAdminsOfSystemError(response, error, context);
   if (error instanceof AdminActivityWriteError) {
     response.status(502).json({ error: "The location was saved, but its administrator activity entry could not be saved. Do not repeat the change; contact support." });
     return;
@@ -396,6 +398,7 @@ async function recordAttendance(
           await alertGeofenceViolation(admin, user, location, distance);
         } catch (alertError: unknown) {
           console.error("Could not record or notify administrators about an outside-area attendance attempt.", alertError);
+          await notifyAdminsOfSystemError(response, alertError, "Could not record or notify administrators about an outside-area attendance attempt.");
         }
       }
       response.status(403).json({

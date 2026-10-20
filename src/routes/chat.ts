@@ -2,6 +2,7 @@ import { Router } from "express";
 import type { Request, Response } from "express";
 import { requireUser } from "../auth/requireUser.js";
 import { createSupabaseAdminClient } from "../services/supabaseAdmin.js";
+import { notifyAdminsOfSystemError } from "../services/systemNotifications.js";
 
 const router = Router();
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -27,8 +28,9 @@ function messagePreview(body: string) {
   return body;
 }
 
-function sendChatError(response: Response, error: unknown, context: string) {
+async function sendChatError(response: Response, error: unknown, context: string) {
   console.error(context, error);
+  await notifyAdminsOfSystemError(response, error, context);
   if (error instanceof Error && error.message.includes("Missing required environment variable")) {
     response.status(503).json({ error: "Messaging is not configured yet. Please contact your administrator." });
     return;

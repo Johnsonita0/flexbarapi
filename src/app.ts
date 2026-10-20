@@ -12,6 +12,7 @@ import { callsRouter } from "./routes/calls.js";
 import { accountSessionRouter } from "./routes/accountSession.js";
 import { callPushRouter } from "./routes/callPush.js";
 import { pushNotificationsRouter } from "./routes/pushNotifications.js";
+import { notifyAdminsOfSystemError } from "./services/systemNotifications.js";
 
 const app = express();
 const allowedOrigins = (process.env.FRONTEND_ORIGINS ?? "http://localhost:5173")
@@ -80,9 +81,10 @@ app.use("/api/v1/department", departmentRouter);
 app.use("/api/v1/chat", chatRouter);
 app.use("/api/v1/calls", callsRouter);
 
-app.use((error: unknown, _request: express.Request, response: express.Response, _next: express.NextFunction) => {
+app.use(async (error: unknown, _request: express.Request, response: express.Response, _next: express.NextFunction) => {
   console.error("Unhandled API request error.", error);
   if (response.headersSent) return;
+  await notifyAdminsOfSystemError(response, error, "Unhandled API request error.");
   response.status(500).json({ error: "An unexpected server error occurred." });
 });
 

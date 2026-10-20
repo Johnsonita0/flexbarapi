@@ -3,12 +3,14 @@ import type { Request, Response } from "express";
 import { requireUser } from "../auth/requireUser.js";
 import { createSupabaseAdminClient } from "../services/supabaseAdmin.js";
 import { getCallPushConfig } from "../services/callPush.js";
+import { notifyAdminsOfSystemError } from "../services/systemNotifications.js";
 
 const router = Router();
 const base64UrlPattern = /^[A-Za-z0-9_-]{20,200}$/;
 
-function sendPushError(response: Response, error: unknown, context: string) {
+async function sendPushError(response: Response, error: unknown, context: string) {
   console.error(context, error);
+  await notifyAdminsOfSystemError(response, error, context);
   response.status(500).json({ error: "We couldn't update call notifications. Please try again." });
 }
 

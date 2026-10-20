@@ -5,6 +5,7 @@ import { requireUser } from "../auth/requireUser.js";
 import { appRoles, isAppRole } from "../auth/roles.js";
 import { AdminActivityWriteError, recordAdminActivity } from "../services/adminActivity.js";
 import { createSupabaseAdminClient } from "../services/supabaseAdmin.js";
+import { notifyAdminsOfSystemError } from "../services/systemNotifications.js";
 
 const router = Router();
 const primaryAdminId = "9668b2c5-428f-4d38-a29f-b5de8aa3d6b0";
@@ -35,8 +36,9 @@ function frontendRedirect(request: Request, query: string): string | undefined {
   return redirect.toString();
 }
 
-function sendAdminError(response: Response, error: unknown, message: string) {
+async function sendAdminError(response: Response, error: unknown, message: string) {
   console.error(message, error);
+  await notifyAdminsOfSystemError(response, error, message);
   if (error instanceof AdminActivityWriteError) {
     response.status(502).json({ error: "The change was saved, but its administrator activity entry could not be saved. Do not repeat the change; contact support." });
     return;
