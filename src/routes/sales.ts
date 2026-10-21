@@ -84,7 +84,7 @@ router.get("/catalog", async (request, response) => {
     const admin = createSupabaseAdminClient();
     let productsQuery = admin
       .from("products")
-      .select("id, name, category, stock_quantity, unit, image_path, department_id, unit_price")
+      .select("id, name, category, barcode, stock_quantity, unit, image_path, department_id, unit_price")
       .not("department_id", "is", null)
       .gt("unit_price", 0)
       .order("name");
@@ -108,6 +108,7 @@ router.get("/catalog", async (request, response) => {
           id: product.id,
           name: product.name,
           category: product.category,
+          barcode: product.barcode,
           stock: product.stock_quantity,
           unit: product.unit,
           imagePath: product.image_path,

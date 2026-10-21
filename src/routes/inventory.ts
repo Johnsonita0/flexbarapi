@@ -33,24 +33,33 @@ router.get("/products", async (request, response) => {
   if (!requireInventoryRole(request, response)) return;
   try {
     const admin = createSupabaseAdminClient();
-    const [{ data, error }, { data: departments, error: departmentError }] = await Promise.all([
+    const [{ data, error }, { data: departments, error: departmentError }, { data: pendingDeliveries, error: deliveriesError }] = await Promise.all([
       admin
       .from("products")
-      .select("id, name, category, stock_quantity, unit, reorder_level, image_path, department_id, unit_price, created_at, updated_at")
+      .select("id, name, category, barcode, stock_quantity, central_stock_quantity, unit, reorder_level, image_path, department_id, unit_price, created_at, updated_at")
+      .eq("company_id", request.flexbarUser?.companyId)
       .order("name"),
-      admin.from("departments").select("id, name, head_user_id"),
+      admin.from("departments").select("id, name, head_user_id").eq("company_id", request.flexbarUser?.companyId),
+      admin.from("stock_deliveries").select("product_id, quantity").eq("company_id", request.flexbarUser?.companyId).is("received_at", null),
     ]);
-    if (error || departmentError) {
-      sendInventoryError(response, error ?? departmentError, "Could not load inventory products.");
+    if (error || departmentError || deliveriesError) {
+      sendInventoryError(response, error ?? departmentError ?? deliveriesError, "Could not load inventory products.");
       return;
     }
     const departmentById = new Map((departments ?? []).map((department) => [department.id, department.name]));
+    const inTransitByProduct = new Map<string, number>();
+    for (const delivery of pendingDeliveries ?? []) {
+      inTransitByProduct.set(delivery.product_id, (inTransitByProduct.get(delivery.product_id) ?? 0) + delivery.quantity);
+    }
     response.status(200).json({
       products: (data ?? []).map((product) => ({
         id: product.id,
         name: product.name,
         category: product.category,
+        barcode: product.barcode,
         stock: product.stock_quantity,
+        centralStock: product.central_stock_quantity,
+        inTransitStock: inTransitByProduct.get(product.id) ?? 0,
         unit: product.unit,
         reorder: product.reorder_level,
         imagePath: product.image_path,
@@ -69,10 +78,12 @@ router.get("/products", async (request, response) => {
 
 router.post("/products", async (request, response) => {
   if (!requireInventoryRole(request, response)) return;
-  const { name, category, stock, unit, reorder, imagePath, departmentId, price } = request.body ?? {};
+  const { name, category, barcode, stock, unit, reorder, imagePath, departmentId, price } = request.body ?? {};
+  const normalizedBarcode = typeof barcode === "string" ? barcode.trim() || null : barcode ?? null;
   if (
     typeof name !== "string" || name.trim().length < 2 || name.trim().length > 120 ||
     typeof category !== "string" || category.trim().length < 2 || category.trim().length > 80 ||
+    (normalizedBarcode !== null && (typeof normalizedBarcode !== "string" || normalizedBarcode.length > 100)) ||
     !Number.isInteger(stock) || stock < 0 ||
     typeof unit !== "string" || unit.trim().length < 1 || unit.trim().length > 30 ||
     !Number.isInteger(reorder) || reorder < 0 ||
@@ -84,7 +95,7 @@ router.post("/products", async (request, response) => {
        !imagePathPattern.test(imagePath) ||
        !imagePath.startsWith(`${request.flexbarUser?.id}/`)))
   ) {
-    response.status(400).json({ error: "Enter a valid product name, category, stock quantity, unit, reorder level, sale price, and image; opening stock also requires a department." });
+    response.status(400).json({ error: "Enter a valid product name, barcode, category, stock quantity, unit, reorder level, sale price, and image; opening stock also requires a department." });
     return;
   }
 
@@ -93,16 +104,13 @@ router.post("/products", async (request, response) => {
     if (departmentId) {
       const { data: department, error: departmentError } = await admin
         .from("departments")
-        .select("id, head_user_id")
+        .select("id")
         .eq("id", departmentId)
+        .eq("company_id", request.flexbarUser?.companyId)
         .maybeSingle();
       if (departmentError || !department) {
         if (departmentError) sendInventoryError(response, departmentError, "Could not verify the product department.");
         else response.status(400).json({ error: "Choose an existing department." });
-        return;
-      }
-      if (stock > 0 && !department.head_user_id) {
-        response.status(409).json({ error: "Assign a head of department before sending stock to this team." });
         return;
       }
     }
@@ -111,7 +119,9 @@ router.post("/products", async (request, response) => {
       .insert({
         name: name.trim(),
         category: category.trim(),
+        barcode: normalizedBarcode,
         stock_quantity: 0,
+        central_stock_quantity: stock,
         unit: unit.trim(),
         reorder_level: reorder,
         image_path: imagePath ?? null,
@@ -119,25 +129,29 @@ router.post("/products", async (request, response) => {
         unit_price: price,
         created_by: request.flexbarUser?.id,
       })
-      .select("id, name, category, stock_quantity, unit, reorder_level, image_path, department_id, unit_price, created_at, updated_at")
+      .select("id, name, category, barcode, stock_quantity, central_stock_quantity, unit, reorder_level, image_path, department_id, unit_price, created_at, updated_at")
       .single();
     if (error) {
+      if (error.code === "23505") {
+        response.status(409).json({ error: "This barcode is already assigned to another product." });
+        return;
+      }
       sendInventoryError(response, error, "Could not save an inventory product.");
       return;
     }
-    if (stock > 0 && departmentId) {
+    if (stock > 0) {
       const { error: deliveryError } = await admin
-        .from("stock_deliveries")
+        .from("central_stock_receipts")
         .insert({
-          department_id: departmentId,
+          company_id: request.flexbarUser?.companyId,
           product_id: data.id,
           quantity: stock,
-          created_by: request.flexbarUser?.id,
+          received_by: request.flexbarUser?.id,
         });
       if (deliveryError) {
         const { error: cleanupError } = await admin.from("products").delete().eq("id", data.id);
-        if (cleanupError) console.error("Could not remove product after its initial stock dispatch failed.", cleanupError);
-        sendInventoryError(response, deliveryError, "Could not record the initial department stock delivery.");
+        if (cleanupError) console.error("Could not remove product after its opening central stock receipt failed.", cleanupError);
+        sendInventoryError(response, deliveryError, "Could not record the opening central stock receipt.");
         return;
       }
     }
@@ -146,7 +160,10 @@ router.post("/products", async (request, response) => {
         id: data.id,
         name: data.name,
         category: data.category,
-        stock: 0,
+        barcode: data.barcode,
+        stock: data.stock_quantity,
+        centralStock: data.central_stock_quantity,
+        inTransitStock: 0,
         unit: data.unit,
         reorder: data.reorder_level,
         imagePath: data.image_path,
@@ -154,9 +171,8 @@ router.post("/products", async (request, response) => {
         price: Number(data.unit_price),
         createdAt: data.created_at,
         updatedAt: data.updated_at,
-        stockDispatchQuantity: stock,
       },
-      message: stock > 0 ? "Product created and stock sent to the department head for receipt." : "Product created.",
+      message: stock > 0 ? "Product created and opening stock added to central inventory." : "Product created.",
     });
   } catch (error: unknown) {
     sendInventoryError(response, error, "Could not initialize inventory product creation.");
@@ -174,9 +190,9 @@ router.get("/deliveries", async (request, response) => {
     const admin = createSupabaseAdminClient();
     let query = admin
       .from("stock_deliveries")
-      .select("id, department_id, product_id, quantity, created_by, created_at, received_by, received_at")
-      .order("created_at", { ascending: false })
-      .limit(100);
+      .select("id, department_id, product_id, quantity, received_quantity, created_by, created_at, received_by, received_at")
+      .eq("company_id", user.companyId)
+      .order("created_at", { ascending: false });
     if (!canViewAll) {
       if (!user.departmentId) {
         response.status(403).json({ error: "Assign your account to a department to view stock deliveries." });
@@ -206,7 +222,7 @@ router.get("/deliveries", async (request, response) => {
     const departmentIds = [...new Set((deliveries ?? []).map((delivery) => delivery.department_id))];
     const profileIds = [...new Set((deliveries ?? []).flatMap((delivery) => [delivery.created_by, delivery.received_by].filter((id): id is string => Boolean(id))))];
     const [{ data: products, error: productsError }, { data: departments, error: departmentsError }, { data: profiles, error: profilesError }] = await Promise.all([
-      productIds.length ? admin.from("products").select("id, name, unit").in("id", productIds) : Promise.resolve({ data: [], error: null }),
+      productIds.length ? admin.from("products").select("id, name, unit, stock_quantity").in("id", productIds) : Promise.resolve({ data: [], error: null }),
       departmentIds.length ? admin.from("departments").select("id, name, head_user_id").in("id", departmentIds) : Promise.resolve({ data: [], error: null }),
       profileIds.length ? admin.from("profiles").select("id, display_name").in("id", profileIds) : Promise.resolve({ data: [], error: null }),
     ]);
@@ -218,6 +234,25 @@ router.get("/deliveries", async (request, response) => {
     const productById = new Map((products ?? []).map((product) => [product.id, product]));
     const departmentById = new Map((departments ?? []).map((department) => [department.id, department]));
     const profileById = new Map((profiles ?? []).map((profile) => [profile.id, profile.display_name ?? "Team member"]));
+    const receivedByProduct = new Map<string, typeof deliveries>();
+    for (const delivery of deliveries ?? []) {
+      if (delivery.received_at) {
+        receivedByProduct.set(delivery.product_id, [...(receivedByProduct.get(delivery.product_id) ?? []), delivery]);
+      }
+    }
+    const deliveryBalances = new Map<string, number>();
+    for (const [productId, productDeliveries] of receivedByProduct) {
+      const product = productById.get(productId);
+      let remainingStock = Math.min(
+        product?.stock_quantity ?? 0,
+        productDeliveries.reduce((sum, delivery) => sum + delivery.received_quantity, 0),
+      );
+      for (const delivery of [...productDeliveries].reverse()) {
+        const remaining = Math.min(delivery.received_quantity, remainingStock);
+        deliveryBalances.set(delivery.id, remaining);
+        remainingStock -= remaining;
+      }
+    }
     response.status(200).json({
       deliveries: (deliveries ?? []).map((delivery) => ({
         id: delivery.id,
@@ -227,6 +262,10 @@ router.get("/deliveries", async (request, response) => {
         productName: productById.get(delivery.product_id)?.name ?? "Product",
         unit: productById.get(delivery.product_id)?.unit ?? "items",
         quantity: delivery.quantity,
+        receivedQuantity: delivery.received_quantity,
+        remainingQuantity: delivery.received_at ? deliveryBalances.get(delivery.id) ?? 0 : 0,
+        soldQuantity: delivery.received_at ? delivery.received_quantity - (deliveryBalances.get(delivery.id) ?? 0) : 0,
+        departmentStock: productById.get(delivery.product_id)?.stock_quantity ?? 0,
         createdBy: delivery.created_by,
         createdByName: profileById.get(delivery.created_by) ?? "Team member",
         createdAt: delivery.created_at,
@@ -250,66 +289,47 @@ router.post("/deliveries", async (request, response) => {
   }
   try {
     const admin = createSupabaseAdminClient();
-    const { data: product, error: productError } = await admin
-      .from("products")
-      .select("id, department_id")
-      .eq("id", productId)
-      .maybeSingle();
-    if (productError || !product) {
-      if (productError) sendInventoryError(response, productError, "Could not verify stock delivery product.");
-      else response.status(404).json({ error: "That product could not be found." });
-      return;
-    }
-    if (!product.department_id) {
-      response.status(400).json({ error: "Assign the product to a department before dispatching stock." });
-      return;
-    }
-    const { data: department, error: departmentError } = await admin
-      .from("departments")
-      .select("head_user_id")
-      .eq("id", product.department_id)
-      .maybeSingle();
-    if (departmentError) {
-      sendInventoryError(response, departmentError, "Could not verify the receiving department head.");
-      return;
-    }
-    if (!department?.head_user_id) {
-      response.status(409).json({ error: "Assign a head of department before sending stock to this team." });
-      return;
-    }
-    const { data: head, error: headError } = await admin
-      .from("profiles")
-      .select("id")
-      .eq("id", department.head_user_id)
-      .eq("department_id", product.department_id)
-      .eq("is_active", true)
-      .eq("is_archived", false)
-      .maybeSingle();
-    if (headError) {
-      sendInventoryError(response, headError, "Could not verify the active department head.");
-      return;
-    }
-    if (!head) {
-      response.status(409).json({ error: "Assign an active department head before sending stock." });
-      return;
-    }
-    const { data: delivery, error } = await admin
-      .from("stock_deliveries")
-      .insert({
-        department_id: product.department_id,
-        product_id: product.id,
-        quantity,
-        created_by: request.flexbarUser?.id,
-      })
-      .select("id, quantity, created_at")
-      .single();
+    const { data: deliveryId, error } = await admin.rpc("dispatch_department_stock", {
+      p_product_id: productId,
+      p_quantity: quantity,
+      p_sender_id: request.flexbarUser?.id,
+    });
     if (error) {
-      sendInventoryError(response, error, "Could not record stock dispatch.");
+      response.status(409).json({ error: error.message });
       return;
     }
-    response.status(201).json({ delivery: { id: delivery.id, quantity: delivery.quantity, createdAt: delivery.created_at }, message: "Stock sent to the department head for receipt." });
+    response.status(201).json({ deliveryId, message: "Stock reserved from central inventory and sent to the department head for receipt." });
   } catch (error: unknown) {
     sendInventoryError(response, error, "Could not initialize stock dispatch.");
+  }
+});
+
+router.post("/products/:productId/central-stock", async (request, response) => {
+  if (!requireInventoryRole(request, response)) return;
+  const { productId } = request.params;
+  const { quantity } = request.body ?? {};
+  if (typeof productId !== "string" || !uuidPattern.test(productId) || !Number.isInteger(quantity) || quantity < 1 || quantity > 1_000_000) {
+    response.status(400).json({ error: "Choose a product and enter a stock quantity greater than zero." });
+    return;
+  }
+  try {
+    const admin = createSupabaseAdminClient();
+    const { data, error } = await admin.rpc("add_central_stock", {
+      p_product_id: productId,
+      p_quantity: quantity,
+      p_receiver_id: request.flexbarUser?.id,
+    });
+    if (error) {
+      if (error.code === "P0002") {
+        response.status(404).json({ error: "That product could not be found." });
+        return;
+      }
+      sendInventoryError(response, error, "Could not record a central stock receipt.");
+      return;
+    }
+    response.status(201).json({ centralStock: data, message: "Central stock receipt recorded." });
+  } catch (error: unknown) {
+    sendInventoryError(response, error, "Could not initialize a central stock receipt.");
   }
 });
 
@@ -324,18 +344,29 @@ router.post("/deliveries/:deliveryId/receive", async (request, response) => {
     response.status(400).json({ error: "Choose a valid stock delivery." });
     return;
   }
+  const receivedQuantity = request.body?.receivedQuantity;
+  if (!Number.isInteger(receivedQuantity) || receivedQuantity < 0 || receivedQuantity > 1_000_000) {
+    response.status(400).json({ error: "Enter a valid quantity received, including zero if the delivery is rejected." });
+    return;
+  }
   try {
     const admin = createSupabaseAdminClient();
     const { data, error } = await admin.rpc("receive_department_stock", {
       p_delivery_id: deliveryId,
       p_receiver_id: user.id,
+      p_received_quantity: receivedQuantity,
     });
     if (error) {
       console.error("Department stock receipt was rejected.", error);
       response.status(409).json({ error: error.message });
       return;
     }
-    response.status(200).json({ stock: data, message: "Stock received and inventory updated." });
+    response.status(200).json({
+      stock: data,
+      message: receivedQuantity === 0
+        ? "Delivery rejected and reserved stock returned to central inventory."
+        : "Stock receipt confirmed and inventory updated.",
+    });
   } catch (error: unknown) {
     sendInventoryError(response, error, "Could not receive department stock.");
   }
@@ -344,11 +375,13 @@ router.post("/deliveries/:deliveryId/receive", async (request, response) => {
 router.patch("/products/:productId", async (request, response) => {
   if (!requireInventoryRole(request, response)) return;
   const { productId } = request.params;
-  const { name, category, unit, departmentId, price, imagePath } = request.body ?? {};
+  const { name, category, barcode, unit, departmentId, price, imagePath } = request.body ?? {};
+  const normalizedBarcode = typeof barcode === "string" ? barcode.trim() || null : barcode ?? null;
   if (
     typeof productId !== "string" || !uuidPattern.test(productId) ||
     typeof name !== "string" || name.trim().length < 2 || name.trim().length > 120 ||
     typeof category !== "string" || category.trim().length < 2 || category.trim().length > 80 ||
+    (normalizedBarcode !== null && (typeof normalizedBarcode !== "string" || normalizedBarcode.length > 100)) ||
     typeof unit !== "string" || unit.trim().length < 1 || unit.trim().length > 30 ||
     typeof departmentId !== "string" || !uuidPattern.test(departmentId) ||
     typeof price !== "number" || !Number.isFinite(price) || price < 0 ||
@@ -357,7 +390,7 @@ router.patch("/products/:productId", async (request, response) => {
        !imagePathPattern.test(imagePath) ||
        !imagePath.startsWith(`${request.flexbarUser?.id}/`)))
   ) {
-    response.status(400).json({ error: "Enter a valid product name, category, unit, department, sale price, and image." });
+    response.status(400).json({ error: "Enter a valid product name, barcode, category, unit, department, sale price, and image." });
     return;
   }
   try {
@@ -366,6 +399,7 @@ router.patch("/products/:productId", async (request, response) => {
       .from("departments")
       .select("id")
       .eq("id", departmentId)
+      .eq("company_id", request.flexbarUser?.companyId)
       .maybeSingle();
     if (departmentError || !department) {
       if (departmentError) sendInventoryError(response, departmentError, "Could not verify the product department.");
@@ -376,6 +410,7 @@ router.patch("/products/:productId", async (request, response) => {
       .from("products")
       .select("id, stock_quantity, department_id")
       .eq("id", productId)
+      .eq("company_id", request.flexbarUser?.companyId)
       .maybeSingle();
     if (existingProductError) {
       sendInventoryError(response, existingProductError, "Could not verify the product before editing.");
@@ -410,6 +445,7 @@ router.patch("/products/:productId", async (request, response) => {
       .update({
         name: name.trim(),
         category: category.trim(),
+        barcode: normalizedBarcode,
         unit: unit.trim(),
         department_id: departmentId,
         unit_price: price,
@@ -417,9 +453,13 @@ router.patch("/products/:productId", async (request, response) => {
         updated_at: new Date().toISOString(),
       })
       .eq("id", productId)
-      .select("id, name, category, unit, image_path, department_id, unit_price")
+      .select("id, name, category, barcode, unit, image_path, department_id, unit_price")
       .maybeSingle();
     if (error) {
+      if (error.code === "23505") {
+        response.status(409).json({ error: "This barcode is already assigned to another product." });
+        return;
+      }
       sendInventoryError(response, error, "Could not update the product's selling assignment.");
       return;
     }
@@ -432,6 +472,7 @@ router.patch("/products/:productId", async (request, response) => {
         id: data.id,
         name: data.name,
         category: data.category,
+        barcode: data.barcode,
         unit: data.unit,
         imagePath: data.image_path,
         departmentId: data.department_id,

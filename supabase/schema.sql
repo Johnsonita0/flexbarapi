@@ -469,7 +469,9 @@ create table if not exists public.products (
   id uuid primary key default gen_random_uuid(),
   name text not null check (char_length(trim(name)) between 2 and 120),
   category text not null check (char_length(trim(category)) between 2 and 80),
+  barcode text,
   stock_quantity integer not null default 0 check (stock_quantity >= 0),
+  central_stock_quantity integer not null default 0 check (central_stock_quantity >= 0),
   unit text not null default 'items' check (char_length(trim(unit)) between 1 and 30),
   reorder_level integer not null default 5 check (reorder_level >= 0),
   image_path text,
@@ -479,6 +481,23 @@ create table if not exists public.products (
 );
 
 create index if not exists products_name_idx on public.products (lower(name));
+
+do $$
+begin
+  if exists (
+    select 1 from information_schema.columns
+    where table_schema = 'public' and table_name = 'products' and column_name = 'company_id'
+  ) then
+    create unique index if not exists products_company_barcode_unique_idx
+      on public.products (company_id, barcode)
+      where barcode is not null;
+  else
+    create unique index if not exists products_barcode_unique_idx
+      on public.products (barcode)
+      where barcode is not null;
+  end if;
+end;
+$$;
 
 alter table public.products enable row level security;
 revoke all on public.products from anon, authenticated;
@@ -590,6 +609,8 @@ create table if not exists public.stock_deliveries (
   department_id uuid not null references public.departments (id) on delete restrict,
   product_id uuid not null references public.products (id) on delete restrict,
   quantity integer not null check (quantity > 0),
+  received_quantity integer not null default 0 check (received_quantity >= 0 and received_quantity <= quantity),
+  central_reserved boolean not null default false,
   created_by uuid not null references public.profiles (id) on delete restrict,
   created_at timestamptz not null default now(),
   received_by uuid references public.profiles (id) on delete restrict,
@@ -597,16 +618,29 @@ create table if not exists public.stock_deliveries (
   check ((received_by is null and received_at is null) or (received_by is not null and received_at is not null))
 );
 
+create table if not exists public.central_stock_receipts (
+  id uuid primary key default gen_random_uuid(),
+  company_id uuid not null,
+  product_id uuid not null references public.products (id) on delete restrict,
+  quantity integer not null check (quantity > 0),
+  received_by uuid not null references public.profiles (id) on delete restrict,
+  created_at timestamptz not null default now()
+);
+
 create index if not exists stock_deliveries_department_created_idx
   on public.stock_deliveries (department_id, created_at desc);
+create index if not exists central_stock_receipts_product_created_idx
+  on public.central_stock_receipts (product_id, created_at desc);
 
 alter table public.sales enable row level security;
 alter table public.sale_items enable row level security;
 alter table public.stock_handovers enable row level security;
 alter table public.stock_handover_items enable row level security;
 alter table public.stock_deliveries enable row level security;
+alter table public.central_stock_receipts enable row level security;
 revoke all on public.sales, public.sale_items, public.stock_handovers, public.stock_handover_items from anon, authenticated;
 revoke all on public.stock_deliveries from anon, authenticated;
+revoke all on public.central_stock_receipts from anon, authenticated;
 
 drop function if exists public.record_department_sale(uuid, uuid, text, jsonb);
 create function public.record_department_sale(
@@ -843,8 +877,9 @@ $$;
 revoke all on function public.accept_stock_handover(uuid, uuid, jsonb) from public, anon, authenticated;
 grant execute on function public.accept_stock_handover(uuid, uuid, jsonb) to service_role;
 
-create or replace function public.receive_department_stock(
-  p_delivery_id uuid,
+create or replace function public.add_central_stock(
+  p_product_id uuid,
+  p_quantity integer,
   p_receiver_id uuid
 )
 returns integer
@@ -853,16 +888,135 @@ security definer
 set search_path = ''
 as $$
 declare
+  product_row public.products%rowtype;
+  updated_quantity integer;
+begin
+  if p_quantity < 1 then
+    raise exception 'Stock quantity must be greater than zero';
+  end if;
+  select * into product_row from public.products where id = p_product_id for update;
+  if not found then
+    raise exception 'Product not found' using errcode = 'P0002';
+  end if;
+  if not exists (
+    select 1 from public.profiles
+    where id = p_receiver_id and is_active and not is_archived
+      and company_id = product_row.company_id
+      and role in ('super_admin', 'management_admin', 'inventory_officer')
+  ) then
+    raise exception 'You do not have permission to add central stock';
+  end if;
+  update public.products
+  set central_stock_quantity = central_stock_quantity + p_quantity, updated_at = now()
+  where id = p_product_id
+  returning central_stock_quantity into updated_quantity;
+  insert into public.central_stock_receipts (company_id, product_id, quantity, received_by)
+  values (product_row.company_id, p_product_id, p_quantity, p_receiver_id);
+  return updated_quantity;
+end;
+$$;
+
+revoke all on function public.add_central_stock(uuid, integer, uuid) from public, anon, authenticated;
+grant execute on function public.add_central_stock(uuid, integer, uuid) to service_role;
+
+create or replace function public.dispatch_department_stock(
+  p_product_id uuid,
+  p_quantity integer,
+  p_sender_id uuid
+)
+returns uuid
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  product_row public.products%rowtype;
+  department_head_id uuid;
+  delivery_id uuid;
+begin
+  if p_quantity < 1 then
+    raise exception 'Stock quantity must be greater than zero';
+  end if;
+  select * into product_row from public.products where id = p_product_id for update;
+  if not found then
+    raise exception 'Product not found' using errcode = 'P0002';
+  end if;
+  if not exists (
+    select 1 from public.profiles
+    where id = p_sender_id and is_active and not is_archived
+      and company_id = product_row.company_id
+      and role in ('super_admin', 'management_admin', 'inventory_officer')
+  ) then
+    raise exception 'You do not have permission to dispatch stock';
+  end if;
+  if product_row.department_id is null then
+    raise exception 'Assign the product to a department before dispatching stock';
+  end if;
+  if product_row.central_stock_quantity < p_quantity then
+    raise exception 'There is not enough stock in central inventory';
+  end if;
+  select head_user_id into department_head_id from public.departments
+  where id = product_row.department_id and company_id = product_row.company_id;
+  if department_head_id is null or not exists (
+    select 1 from public.profiles
+    where id = department_head_id and department_id = product_row.department_id
+      and company_id = product_row.company_id and is_active and not is_archived
+  ) then
+    raise exception 'Assign an active department head before sending stock';
+  end if;
+  update public.products
+  set central_stock_quantity = central_stock_quantity - p_quantity, updated_at = now()
+  where id = p_product_id;
+  insert into public.stock_deliveries (department_id, product_id, quantity, central_reserved, created_by)
+  values (product_row.department_id, p_product_id, p_quantity, true, p_sender_id)
+  returning id into delivery_id;
+  return delivery_id;
+end;
+$$;
+
+revoke all on function public.dispatch_department_stock(uuid, integer, uuid) from public, anon, authenticated;
+grant execute on function public.dispatch_department_stock(uuid, integer, uuid) to service_role;
+
+drop function if exists public.receive_department_stock(uuid, uuid);
+create or replace function public.receive_department_stock(
+  p_delivery_id uuid,
+  p_receiver_id uuid,
+  p_received_quantity integer
+)
+returns integer
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
   delivery_row public.stock_deliveries%rowtype;
+  product_row public.products%rowtype;
+  delivery_product_id uuid;
   department_head_id uuid;
   updated_quantity integer;
 begin
+  select product_id into delivery_product_id
+  from public.stock_deliveries
+  where id = p_delivery_id;
+  if not found then
+    raise exception 'This stock delivery could not be found';
+  end if;
+  select * into product_row
+  from public.products
+  where id = delivery_product_id
+  for update;
+  if not found then
+    raise exception 'The delivered product could not be found';
+  end if;
   select * into delivery_row
   from public.stock_deliveries
   where id = p_delivery_id
   for update;
   if not found or delivery_row.received_at is not null then
     raise exception 'This stock delivery is not awaiting receipt';
+  end if;
+  if p_received_quantity < 0 or p_received_quantity > delivery_row.quantity then
+    raise exception 'The received quantity must be between zero and the sent quantity';
   end if;
 
   select head_user_id into department_head_id
@@ -874,12 +1028,18 @@ begin
       and is_active
       and not is_archived
       and department_id = delivery_row.department_id
+      and company_id = product_row.company_id
   ) then
     raise exception 'Only the active head of this department can receive its stock';
   end if;
+  if product_row.department_id is distinct from delivery_row.department_id then
+    raise exception 'The delivered product is no longer assigned to this department';
+  end if;
 
   update public.products
-  set stock_quantity = stock_quantity + delivery_row.quantity,
+  set stock_quantity = stock_quantity + p_received_quantity,
+      central_stock_quantity = central_stock_quantity
+        + case when delivery_row.central_reserved then delivery_row.quantity - p_received_quantity else 0 end,
       updated_at = now()
   where id = delivery_row.product_id
     and department_id = delivery_row.department_id
@@ -890,15 +1050,16 @@ begin
 
   update public.stock_deliveries
   set received_by = p_receiver_id,
-      received_at = now()
+      received_at = now(),
+      received_quantity = p_received_quantity
   where id = delivery_row.id;
 
   return updated_quantity;
 end;
 $$;
 
-revoke all on function public.receive_department_stock(uuid, uuid) from public, anon, authenticated;
-grant execute on function public.receive_department_stock(uuid, uuid) to service_role;
+revoke all on function public.receive_department_stock(uuid, uuid, integer) from public, anon, authenticated;
+grant execute on function public.receive_department_stock(uuid, uuid, integer) to service_role;
 
 
 -- ============================================================
