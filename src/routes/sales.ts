@@ -266,6 +266,15 @@ router.get("/report", async (request, response) => {
 
   try {
     const admin = createSupabaseAdminClient();
+    const { data: departments, error: departmentsError } = await admin
+      .from("departments")
+      .select("id, name")
+      .eq("company_id", request.flexbarUser?.companyId);
+    if (departmentsError) {
+      handleError(response, departmentsError, "Could not load administrator sales report departments.");
+      return;
+    }
+    const departmentIds = (departments ?? []).map((department) => department.id);
     const allSales: Array<{
       id: string;
       department_id: string;
@@ -273,51 +282,133 @@ router.get("/report", async (request, response) => {
       total_amount: number | string;
       created_at: string;
     }> = [];
-    for (let offset = 0; ; offset += 1000) {
-      const { data, error } = await admin
-        .from("sales")
-        .select("id, department_id, seller_id, total_amount, created_at")
-        .gte("created_at", `${from}T00:00:00.000Z`)
-        .lt("created_at", new Date(end.getTime() + 86_400_000).toISOString())
-        .order("created_at", { ascending: false })
-        .range(offset, offset + 999);
-      if (error) {
-        handleError(response, error, "Could not load administrator sales report.");
-        return;
+    if (departmentIds.length) {
+      for (let offset = 0; ; offset += 1000) {
+        const { data, error } = await admin
+          .from("sales")
+          .select("id, department_id, seller_id, total_amount, created_at")
+          .in("department_id", departmentIds)
+          .gte("created_at", `${from}T00:00:00.000Z`)
+          .lt("created_at", new Date(end.getTime() + 86_400_000).toISOString())
+          .order("created_at", { ascending: false })
+          .range(offset, offset + 999);
+        if (error) {
+          handleError(response, error, "Could not load administrator sales report.");
+          return;
+        }
+        allSales.push(...(data ?? []));
+        if (!data || data.length < 1000) break;
       }
-      allSales.push(...(data ?? []));
-      if (!data || data.length < 1000) break;
     }
 
     const sales = allSales.slice(0, 100);
-    const ids = [...new Set(allSales.map((sale) => sale.department_id))];
     const sellerIds = [...new Set(sales.map((sale) => sale.seller_id))];
-    const [{ data: departments, error: departmentsError }, { data: profiles, error: profilesError }] = await Promise.all([
-      ids.length ? admin.from("departments").select("id, name").in("id", ids) : Promise.resolve({ data: [], error: null }),
-      sellerIds.length ? admin.from("profiles").select("id, display_name").in("id", sellerIds) : Promise.resolve({ data: [], error: null }),
-    ]);
-    if (departmentsError || profilesError) {
-      handleError(response, departmentsError ?? profilesError, "Could not load sales report details.");
+    const { data: profiles, error: profilesError } = sellerIds.length
+      ? await admin.from("profiles").select("id, display_name").in("id", sellerIds)
+      : { data: [], error: null };
+    if (profilesError) {
+      handleError(response, profilesError, "Could not load sales report details.");
       return;
+    }
+    const purchasePayments: Array<{ amount: number | string; paid_at: string }> = [];
+    for (let offset = 0; ; offset += 1000) {
+      const { data, error } = await admin.from("vendor_purchase_payments")
+        .select("amount, paid_at")
+        .eq("company_id", request.flexbarUser?.companyId)
+        .gte("paid_at", `${from}T00:00:00.000Z`)
+        .lt("paid_at", new Date(end.getTime() + 86_400_000).toISOString())
+        .order("paid_at", { ascending: true })
+        .range(offset, offset + 999);
+      if (error) {
+        handleError(response, error, "Could not load vendor payment report details.");
+        return;
+      }
+      purchasePayments.push(...(data ?? []));
+      if (!data || data.length < 1000) break;
     }
     const departmentNames = new Map((departments ?? []).map((department) => [department.id, department.name]));
     const staffNames = new Map((profiles ?? []).map((profile) => [profile.id, profile.display_name]));
-    const dailyTotals = new Map<string, { date: string; total: number; count: number }>();
+    const dailyTotals = new Map<string, { date: string; total: number; count: number; expenditure: number; cogs: number; costedRevenue: number }>();
     let total = 0;
     for (const sale of allSales) {
       const amount = Number(sale.total_amount);
       const date = sale.created_at.slice(0, 10);
-      const daily = dailyTotals.get(date) ?? { date, total: 0, count: 0 };
+      const daily = dailyTotals.get(date) ?? { date, total: 0, count: 0, expenditure: 0, cogs: 0, costedRevenue: 0 };
       daily.total += amount;
       daily.count += 1;
       dailyTotals.set(date, daily);
       total += amount;
     }
+    let expenditure = 0;
+    for (const payment of purchasePayments ?? []) {
+      const amount = Number(payment.amount);
+      const date = payment.paid_at.slice(0, 10);
+      const daily = dailyTotals.get(date) ?? { date, total: 0, count: 0, expenditure: 0, cogs: 0, costedRevenue: 0 };
+      daily.expenditure += amount;
+      dailyTotals.set(date, daily);
+      expenditure += amount;
+    }
+    let cogs = 0;
+    let costedRevenue = 0;
+    const saleIds = allSales.map((sale) => sale.id);
+    const saleDateById = new Map(allSales.map((sale) => [sale.id, sale.created_at.slice(0, 10)]));
+    for (let offset = 0; offset < saleIds.length; offset += 500) {
+      for (let itemOffset = 0; ; itemOffset += 1000) {
+        const { data: items, error: itemsError } = await admin
+          .from("sale_items")
+          .select("sale_id, line_cost, line_total")
+          .in("sale_id", saleIds.slice(offset, offset + 500))
+          .order("id", { ascending: true })
+          .range(itemOffset, itemOffset + 999);
+        if (itemsError) {
+          handleError(response, itemsError, "Could not load sales cost details.");
+          return;
+        }
+        for (const item of items ?? []) {
+          if (item.line_cost === null) continue;
+          const amount = Number(item.line_cost);
+          const revenue = Number(item.line_total);
+          const date = saleDateById.get(item.sale_id);
+          if (!date) continue;
+          const daily = dailyTotals.get(date) ?? { date, total: 0, count: 0, expenditure: 0, cogs: 0, costedRevenue: 0 };
+          daily.cogs += amount;
+          daily.costedRevenue += revenue;
+          dailyTotals.set(date, daily);
+          cogs += amount;
+          costedRevenue += revenue;
+        }
+        if (!items || items.length < 1000) break;
+      }
+    }
+    for (let offset = 0; offset <= days; offset += 1) {
+      const date = new Date(start.getTime() + offset * 86_400_000).toISOString().slice(0, 10);
+      if (!dailyTotals.has(date)) dailyTotals.set(date, { date, total: 0, count: 0, expenditure: 0, cogs: 0, costedRevenue: 0 });
+    }
+    const grossProfit = costedRevenue - cogs;
+    const daily = [...dailyTotals.values()]
+      .sort((left, right) => left.date.localeCompare(right.date))
+      .map((day) => ({ ...day, grossProfit: day.costedRevenue - day.cogs }));
+    const projectionDays = 30;
     response.status(200).json({
       from,
       to,
-      summary: { total, transactions: allSales.length },
-      daily: [...dailyTotals.values()].sort((left, right) => left.date.localeCompare(right.date)),
+      summary: {
+        total,
+        transactions: allSales.length,
+        expenditure,
+        cogs,
+        grossProfit,
+        costCoverage: total > 0 ? costedRevenue / total : 0,
+        netCashFlow: total - expenditure,
+      },
+      daily,
+      projection: {
+        days: projectionDays,
+        sales: total / (days + 1) * projectionDays,
+        expenditure: expenditure / (days + 1) * projectionDays,
+        grossProfit: grossProfit / (days + 1) * projectionDays,
+        netCashFlow: (total - expenditure) / (days + 1) * projectionDays,
+      },
       sales: sales.map((sale) => ({
         id: sale.id,
         departmentName: departmentNames.get(sale.department_id) ?? "Department",

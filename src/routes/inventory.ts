@@ -84,18 +84,17 @@ router.post("/products", async (request, response) => {
     typeof name !== "string" || name.trim().length < 2 || name.trim().length > 120 ||
     typeof category !== "string" || category.trim().length < 2 || category.trim().length > 80 ||
     (normalizedBarcode !== null && (typeof normalizedBarcode !== "string" || normalizedBarcode.length > 100)) ||
-    !Number.isInteger(stock) || stock < 0 ||
+    !Number.isInteger(stock) || stock !== 0 ||
     typeof unit !== "string" || unit.trim().length < 1 || unit.trim().length > 30 ||
     !Number.isInteger(reorder) || reorder < 0 ||
     (departmentId !== null && departmentId !== undefined && (typeof departmentId !== "string" || !uuidPattern.test(departmentId))) ||
-    (stock > 0 && !departmentId) ||
     typeof price !== "number" || !Number.isFinite(price) || price < 0 ||
     (imagePath !== null && imagePath !== undefined &&
       (typeof imagePath !== "string" ||
        !imagePathPattern.test(imagePath) ||
        !imagePath.startsWith(`${request.flexbarUser?.id}/`)))
   ) {
-    response.status(400).json({ error: "Enter a valid product name, barcode, category, stock quantity, unit, reorder level, sale price, and image; opening stock also requires a department." });
+    response.status(400).json({ error: "Enter valid product details. Record purchased stock through a vendor purchase so its cost and payment are tracked." });
     return;
   }
 
@@ -139,22 +138,6 @@ router.post("/products", async (request, response) => {
       sendInventoryError(response, error, "Could not save an inventory product.");
       return;
     }
-    if (stock > 0) {
-      const { error: deliveryError } = await admin
-        .from("central_stock_receipts")
-        .insert({
-          company_id: request.flexbarUser?.companyId,
-          product_id: data.id,
-          quantity: stock,
-          received_by: request.flexbarUser?.id,
-        });
-      if (deliveryError) {
-        const { error: cleanupError } = await admin.from("products").delete().eq("id", data.id);
-        if (cleanupError) console.error("Could not remove product after its opening central stock receipt failed.", cleanupError);
-        sendInventoryError(response, deliveryError, "Could not record the opening central stock receipt.");
-        return;
-      }
-    }
     response.status(201).json({
       product: {
         id: data.id,
@@ -172,7 +155,7 @@ router.post("/products", async (request, response) => {
         createdAt: data.created_at,
         updatedAt: data.updated_at,
       },
-      message: stock > 0 ? "Product created and opening stock added to central inventory." : "Product created.",
+      message: "Product created. Record vendor purchases to add stock to central inventory.",
     });
   } catch (error: unknown) {
     sendInventoryError(response, error, "Could not initialize inventory product creation.");
@@ -304,32 +287,163 @@ router.post("/deliveries", async (request, response) => {
   }
 });
 
-router.post("/products/:productId/central-stock", async (request, response) => {
+router.post("/products/:productId/central-stock", async (_request, response) => {
+  response.status(410).json({ error: "Central stock must be recorded as a vendor purchase, including its supplier, cost, and payment." });
+});
+
+router.get("/purchases", async (request, response) => {
   if (!requireInventoryRole(request, response)) return;
-  const { productId } = request.params;
-  const { quantity } = request.body ?? {};
-  if (typeof productId !== "string" || !uuidPattern.test(productId) || !Number.isInteger(quantity) || quantity < 1 || quantity > 1_000_000) {
-    response.status(400).json({ error: "Choose a product and enter a stock quantity greater than zero." });
+  try {
+    const admin = createSupabaseAdminClient();
+    const { data: purchases, error } = await admin
+      .from("vendor_purchases")
+      .select("id, product_id, vendor_name, reference, package_quantity, units_per_package, total_units, rate_per_package, invoice_total, created_by, created_at")
+      .eq("company_id", request.flexbarUser?.companyId)
+      .order("created_at", { ascending: false })
+      .limit(100);
+    if (error) {
+      sendInventoryError(response, error, "Could not load vendor purchases.");
+      return;
+    }
+    const purchaseIds = (purchases ?? []).map((purchase) => purchase.id);
+    const productIds = [...new Set((purchases ?? []).map((purchase) => purchase.product_id))];
+    const profileIds = new Set((purchases ?? []).map((purchase) => purchase.created_by));
+    const [{ data: payments, error: paymentError }, { data: products, error: productError }] = await Promise.all([
+      purchaseIds.length
+        ? admin.from("vendor_purchase_payments").select("id, purchase_id, amount, payment_method, paid_by, paid_at").in("purchase_id", purchaseIds).order("paid_at", { ascending: false })
+        : Promise.resolve({ data: [], error: null }),
+      productIds.length
+        ? admin.from("products").select("id, name, unit").in("id", productIds)
+        : Promise.resolve({ data: [], error: null }),
+    ]);
+    for (const payment of payments ?? []) profileIds.add(payment.paid_by);
+    const { data: profiles, error: profileError } = profileIds.size
+      ? await admin.from("profiles").select("id, display_name").in("id", [...profileIds])
+      : { data: [], error: null };
+    const failure = paymentError ?? productError ?? profileError;
+    if (failure) {
+      sendInventoryError(response, failure, "Could not load vendor purchase details.");
+      return;
+    }
+    const productById = new Map((products ?? []).map((product) => [product.id, product]));
+    const profileById = new Map((profiles ?? []).map((profile) => [profile.id, profile.display_name ?? "Team member"]));
+    const paymentsByPurchase = new Map<string, NonNullable<typeof payments>>();
+    for (const payment of payments ?? []) {
+      paymentsByPurchase.set(payment.purchase_id, [...(paymentsByPurchase.get(payment.purchase_id) ?? []), payment]);
+    }
+    response.status(200).json({
+      purchases: (purchases ?? []).map((purchase) => {
+        const purchasePayments = paymentsByPurchase.get(purchase.id) ?? [];
+        const paid = purchasePayments.reduce((sum, payment) => sum + Number(payment.amount), 0);
+        const product = productById.get(purchase.product_id);
+        return {
+          id: purchase.id,
+          productId: purchase.product_id,
+          productName: product?.name ?? "Product",
+          unit: product?.unit ?? "items",
+          vendorName: purchase.vendor_name,
+          reference: purchase.reference,
+          packageQuantity: purchase.package_quantity,
+          unitsPerPackage: purchase.units_per_package,
+          totalUnits: purchase.total_units,
+          ratePerPackage: Number(purchase.rate_per_package),
+          invoiceTotal: Number(purchase.invoice_total),
+          amountPaid: paid,
+          balance: Math.max(0, Number(purchase.invoice_total) - paid),
+          createdByName: profileById.get(purchase.created_by) ?? "Team member",
+          createdAt: purchase.created_at,
+          payments: purchasePayments.map((payment) => ({
+            id: payment.id,
+            amount: Number(payment.amount),
+            method: payment.payment_method,
+            paidByName: profileById.get(payment.paid_by) ?? "Team member",
+            paidAt: payment.paid_at,
+          })),
+        };
+      }),
+    });
+  } catch (error: unknown) {
+    sendInventoryError(response, error, "Could not initialize vendor purchase history.");
+  }
+});
+
+router.post("/purchases", async (request, response) => {
+  if (!requireInventoryRole(request, response)) return;
+  const { productId, vendorName, reference, packageQuantity, unitsPerPackage, ratePerPackage, amountPaid, paymentMethod } = request.body ?? {};
+  if (
+    typeof productId !== "string" || !uuidPattern.test(productId) ||
+    typeof vendorName !== "string" || vendorName.trim().length < 2 || vendorName.trim().length > 160 ||
+    (reference !== undefined && reference !== null && (typeof reference !== "string" || reference.trim().length > 100)) ||
+    !Number.isInteger(packageQuantity) || packageQuantity < 1 ||
+    !Number.isInteger(unitsPerPackage) || unitsPerPackage < 1 ||
+    packageQuantity * unitsPerPackage > 1_000_000 ||
+    typeof ratePerPackage !== "number" || !Number.isFinite(ratePerPackage) || ratePerPackage < 0 ||
+    typeof amountPaid !== "number" || !Number.isFinite(amountPaid) || amountPaid < 0 ||
+    !["cash", "card", "transfer"].includes(paymentMethod)
+  ) {
+    response.status(400).json({ error: "Enter a valid product, vendor, package quantity, units per package, purchase rate, and payment." });
     return;
   }
   try {
     const admin = createSupabaseAdminClient();
-    const { data, error } = await admin.rpc("add_central_stock", {
+    const { data, error } = await admin.rpc("record_vendor_purchase", {
       p_product_id: productId,
-      p_quantity: quantity,
-      p_receiver_id: request.flexbarUser?.id,
+      p_vendor_name: vendorName.trim(),
+      p_package_quantity: packageQuantity,
+      p_units_per_package: unitsPerPackage,
+      p_rate_per_package: ratePerPackage,
+      p_amount_paid: amountPaid,
+      p_payment_method: paymentMethod,
+      p_reference: reference?.trim() || null,
+      p_user_id: request.flexbarUser?.id,
     });
     if (error) {
       if (error.code === "P0002") {
         response.status(404).json({ error: "That product could not be found." });
         return;
       }
-      sendInventoryError(response, error, "Could not record a central stock receipt.");
+      console.error("Vendor purchase could not be recorded.", error);
+      response.status(409).json({ error: error.message });
       return;
     }
-    response.status(201).json({ centralStock: data, message: "Central stock receipt recorded." });
+    response.status(201).json({ ...data, message: "Vendor purchase recorded and stock added to central inventory." });
   } catch (error: unknown) {
-    sendInventoryError(response, error, "Could not initialize a central stock receipt.");
+    sendInventoryError(response, error, "Could not record a vendor purchase.");
+  }
+});
+
+router.post("/purchases/:purchaseId/payments", async (request, response) => {
+  if (!requireInventoryRole(request, response)) return;
+  const { purchaseId } = request.params;
+  const { amount, paymentMethod } = request.body ?? {};
+  if (
+    typeof purchaseId !== "string" || !uuidPattern.test(purchaseId) ||
+    typeof amount !== "number" || !Number.isFinite(amount) || amount <= 0 ||
+    !["cash", "card", "transfer"].includes(paymentMethod)
+  ) {
+    response.status(400).json({ error: "Enter a valid vendor payment amount and method." });
+    return;
+  }
+  try {
+    const admin = createSupabaseAdminClient();
+    const { data, error } = await admin.rpc("record_vendor_purchase_payment", {
+      p_purchase_id: purchaseId,
+      p_amount: amount,
+      p_payment_method: paymentMethod,
+      p_user_id: request.flexbarUser?.id,
+    });
+    if (error) {
+      if (error.code === "P0002") {
+        response.status(404).json({ error: "That vendor purchase could not be found." });
+        return;
+      }
+      console.error("Vendor purchase payment could not be recorded.", error);
+      response.status(409).json({ error: error.message });
+      return;
+    }
+    response.status(201).json({ amountPaid: Number(data), message: "Vendor payment recorded." });
+  } catch (error: unknown) {
+    sendInventoryError(response, error, "Could not record a vendor payment.");
   }
 });
 
@@ -383,7 +497,7 @@ router.patch("/products/:productId", async (request, response) => {
     typeof category !== "string" || category.trim().length < 2 || category.trim().length > 80 ||
     (normalizedBarcode !== null && (typeof normalizedBarcode !== "string" || normalizedBarcode.length > 100)) ||
     typeof unit !== "string" || unit.trim().length < 1 || unit.trim().length > 30 ||
-    typeof departmentId !== "string" || !uuidPattern.test(departmentId) ||
+    (departmentId !== null && departmentId !== undefined && (typeof departmentId !== "string" || !uuidPattern.test(departmentId))) ||
     typeof price !== "number" || !Number.isFinite(price) || price < 0 ||
     (imagePath !== undefined &&
       (typeof imagePath !== "string" ||
@@ -395,16 +509,18 @@ router.patch("/products/:productId", async (request, response) => {
   }
   try {
     const admin = createSupabaseAdminClient();
-    const { data: department, error: departmentError } = await admin
-      .from("departments")
-      .select("id")
-      .eq("id", departmentId)
-      .eq("company_id", request.flexbarUser?.companyId)
-      .maybeSingle();
-    if (departmentError || !department) {
-      if (departmentError) sendInventoryError(response, departmentError, "Could not verify the product department.");
-      else response.status(400).json({ error: "Choose an existing department." });
-      return;
+    if (departmentId) {
+      const { data: department, error: departmentError } = await admin
+        .from("departments")
+        .select("id")
+        .eq("id", departmentId)
+        .eq("company_id", request.flexbarUser?.companyId)
+        .maybeSingle();
+      if (departmentError || !department) {
+        if (departmentError) sendInventoryError(response, departmentError, "Could not verify the product department.");
+        else response.status(400).json({ error: "Choose an existing department." });
+        return;
+      }
     }
     const { data: existingProduct, error: existingProductError } = await admin
       .from("products")
@@ -447,7 +563,7 @@ router.patch("/products/:productId", async (request, response) => {
         category: category.trim(),
         barcode: normalizedBarcode,
         unit: unit.trim(),
-        department_id: departmentId,
+        department_id: departmentId ?? null,
         unit_price: price,
         ...(imagePath === undefined ? {} : { image_path: imagePath }),
         updated_at: new Date().toISOString(),
