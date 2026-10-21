@@ -30,7 +30,7 @@ app.use(
       }
       callback(new Error("This origin is not allowed to access the Flex Bar API."));
     },
-    allowedHeaders: ["Authorization", "Content-Type"],
+    allowedHeaders: ["Authorization", "Content-Type", "Idempotency-Key"],
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   }),
 );

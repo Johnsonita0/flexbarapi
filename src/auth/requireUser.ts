@@ -5,6 +5,7 @@ import { runWithCompany } from "../services/companyContext.js";
 import { notifyAdminsOfSystemError } from "../services/systemNotifications.js";
 import { getSessionIdFromToken } from "./sessionId.js";
 import { isAppRole } from "./roles.js";
+import { idempotentWrites } from "../middleware/idempotentWrites.js";
 
 export async function requireUser(
   request: Request,
@@ -140,5 +141,7 @@ export async function requireUser(
     companyName: company.name,
     businessType: company.business_type,
   };
-  runWithCompany(profile.company_id, next);
+  runWithCompany(profile.company_id, () => {
+    void idempotentWrites(request, response, next);
+  });
 }
