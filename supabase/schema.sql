@@ -97,7 +97,7 @@ create table if not exists public.business_settings (
   id smallint primary key default 1 check (id = 1),
   latitude double precision,
   longitude double precision,
-  geofence_radius_m integer not null default 10 check (geofence_radius_m = 10),
+  geofence_radius_m integer not null default 25 check (geofence_radius_m = 25),
   timezone text not null default 'Africa/Lagos',
   currency text not null default 'NGN' check (currency in ('NGN', 'USD', 'GBP', 'EUR')),
   opening_time time not null default '08:00',

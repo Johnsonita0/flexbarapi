@@ -19,7 +19,7 @@ interface AttendanceLocation extends Coordinates {
 }
 
 const attendanceQrPeriodSeconds = 30;
-const attendanceRadiusMeters = 10;
+const attendanceRadiusMeters = 25;
 
 async function sendAttendanceError(response: Response, error: unknown, context: string) {
   console.error(context, error);
@@ -263,7 +263,7 @@ router.put("/config", async (request, response) => {
   const coordinates = parseCoordinates(request.body);
   const radiusMeters = typeof request.body?.radiusMeters === "number" ? request.body.radiusMeters : NaN;
   if (!coordinates || radiusMeters !== attendanceRadiusMeters) {
-    response.status(400).json({ error: "The attendance geofence is fixed at 10 metres around the approved location." });
+    response.status(400).json({ error: "The attendance geofence is fixed at 25 metres around the approved location." });
     return;
   }
   const timezone = typeof request.body?.timezone === "string" ? request.body.timezone : "Africa/Lagos";
@@ -402,7 +402,7 @@ async function recordAttendance(
         }
       }
       response.status(403).json({
-        error: "Your location is not precise enough to confirm you are inside the 10-metre attendance area. Move closer to the registered location, enable precise location, and try again.",
+        error: "Your location could not be verified at the business. Enable location services and try again while on site.",
       });
       return;
     }
